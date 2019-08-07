@@ -39,12 +39,13 @@ struct vm_t;
 extern "C" {
 #endif
 
-int vcpu_set_msr(struct vcpu_t *vcpu, uint64 index, uint64 value);
-int vcpu_get_msr(struct vcpu_t *vcpu, uint64 index, uint64 *value);
+int vcpu_set_msr(struct vcpu_t *vcpu, uint64_t index, uint64_t value);
+int vcpu_get_msr(struct vcpu_t *vcpu, uint64_t index, uint64_t *value);
 int vcpu_put_fpu(struct vcpu_t *vcpu, struct fx_layout *fl);
 int vcpu_get_fpu(struct vcpu_t *vcpu, struct fx_layout *fl);
 int vcpu_set_regs(struct vcpu_t *vcpu, struct vcpu_state_t *vs);
 int vcpu_get_regs(struct vcpu_t *vcpu, struct vcpu_state_t *vs);
+void vcpu_debug(struct vcpu_t *vcpu, struct hax_debug_t *debug);
 
 void * get_vcpu_host(struct vcpu_t *vcpu);
 int set_vcpu_host(struct vcpu_t *vcpu, void *vcpu_host);
@@ -53,9 +54,13 @@ struct hax_tunnel * get_vcpu_tunnel(struct vcpu_t *vcpu);
 int hax_vcpu_destroy_hax_tunnel(struct vcpu_t *cv);
 int hax_vcpu_setup_hax_tunnel(struct vcpu_t *cv, struct hax_tunnel_info *info);
 int hax_vm_set_ram(struct vm_t *vm, struct hax_set_ram_info *info);
+#ifdef CONFIG_HAX_EPT2
+int hax_vm_set_ram2(struct vm_t *vm, struct hax_set_ram_info2 *info);
+int hax_vm_protect_ram(struct vm_t *vm, struct hax_protect_ram_info *info);
+#endif
 int hax_vm_free_all_ram(struct vm_t *vm);
 int in_pmem_range(struct hax_vcpu_mem *pmem, uint64_t va);
-int hax_vm_alloc_ram(struct vm_t *vm, uint32_t size, uint64_t *va);
+int hax_vm_add_ramblock(struct vm_t *vm, uint64_t start_uva, uint64_t size);
 
 void * get_vm_host(struct vm_t *vm);
 int set_vm_host(struct vm_t *vm, void *vm_host);
@@ -68,7 +73,7 @@ struct vcpu_t * vcpu_create(struct vm_t *vm, void *vm_host, int vcpu_id);
 int hax_vcpu_core_open(struct vcpu_t *vcpu);
 int vcpu_teardown(struct vcpu_t *vcpu);
 int vcpu_execute(struct vcpu_t *vcpu);
-int vcpu_interrupt(struct vcpu_t *vcpu, uint8 vector);
+int vcpu_interrupt(struct vcpu_t *vcpu, uint8_t vector);
 
 /*
  * Find a vcpu with corresponding id, |refer| decides whether a reference count
@@ -89,7 +94,6 @@ int hax_vm_set_qemuversion(struct vm_t *vm, struct hax_qemu_version *ver);
 struct vm_t * hax_create_vm(int *vm_id);
 int hax_teardown_vm(struct vm_t *vm);
 int vcpu_event_pending(struct vcpu_t *vcpu);
-void vcpu_set_panic(struct vcpu_t *vcpu);
 
 #ifdef __cplusplus
 }

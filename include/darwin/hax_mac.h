@@ -120,12 +120,12 @@ static int hax_test_and_clear_bit(int bit, uint64_t *memory)
     return OSTestAndClear(offset, p);
 }
 
-static bool hax_cmpxchg32(uint32 old_val, uint32 new_val, volatile uint32 *addr)
+static bool hax_cmpxchg32(uint32_t old_val, uint32_t new_val, volatile uint32_t *addr)
 {
     return OSCompareAndSwap(old_val, new_val, addr);
 }
 
-static bool hax_cmpxchg64(uint64 old_val, uint64 new_val, volatile uint64 *addr)
+static bool hax_cmpxchg64(uint64_t old_val, uint64_t new_val, volatile uint64_t *addr)
 {
     return OSCompareAndSwap64(old_val, new_val, addr);
 }
@@ -169,38 +169,7 @@ static inline errno_t memcpy_s(void *dest, size_t destsz, const void *src,
     return 0;
 }
 
-extern int default_hax_log_level;
-
-#define hax_error(x...) {                          \
-            if (HAX_LOGE >= default_hax_log_level) \
-                printf("haxm_error: " x);          \
-        }
-
-#define hax_warning(x...) {                        \
-            if (HAX_LOGW >= default_hax_log_level) \
-                printf("haxm_warn: " x);           \
-        }
-
-#define hax_info(x...) {                           \
-            if (HAX_LOGI >= default_hax_log_level) \
-                printf("haxm_info: " x);           \
-        }
-
-#define hax_debug(x...) {                          \
-            if (HAX_LOGD >= default_hax_log_level) \
-                printf("haxm_debug: " x);          \
-        }
-
-#define hax_log hax_info
-
-#define hax_panic panic
-
-#define hax_panic_vcpu(v, x...) {     \
-            printf("haxm_panic: " x); \
-            v->paniced = 1;           \
-        }
-
-#define ASSERT(condition) assert(condition)
+#define hax_assert(condition) assert(condition)
 
 static inline bool cpu_is_online(int cpu)
 {
@@ -208,5 +177,15 @@ static inline bool cpu_is_online(int cpu)
         return 0;
     return !!(((uint64_t)1 << cpu) & cpu_online_map);
 }
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+extern int cpu_number(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // HAX_DARWIN_HAX_MAC_H_

@@ -29,14 +29,16 @@
  */
 
 #include "../include/hax.h"
-#include "include/ia32.h"
+#include "include/compiler.h"
+#include "include/ia32_defs.h"
 #include "include/vcpu.h"
 #include "include/mtrr.h"
 #include "include/vmx.h"
 #include "include/cpu.h"
+#include "include/cpuid.h"
 #include "include/vm.h"
 #include "include/debug.h"
-#include "include/dump_vmcs.h"
+#include "include/dump.h"
 
 #include "include/intr.h"
 #include "include/vtlb.h"
@@ -45,7 +47,7 @@
 #include "include/hax_core_interface.h"
 #include "include/hax_driver.h"
 
-uint64 gmsr_list[NR_GMSR] = {
+uint64_t gmsr_list[NR_GMSR] = {
     IA32_STAR,
     IA32_LSTAR,
     IA32_CSTAR,
@@ -53,7 +55,7 @@ uint64 gmsr_list[NR_GMSR] = {
     IA32_KERNEL_GS_BASE
 };
 
-uint64 hmsr_list[NR_HMSR] = {
+uint64_t hmsr_list[NR_HMSR] = {
     IA32_EFER,
     IA32_STAR,
     IA32_LSTAR,
@@ -62,7 +64,7 @@ uint64 hmsr_list[NR_HMSR] = {
     IA32_KERNEL_GS_BASE
 };
 
-uint64 emt64_msr[NR_EMT64MSR] = {
+uint64_t emt64_msr[NR_EMT64MSR] = {
     IA32_STAR,
     IA32_LSTAR,
     IA32_CSTAR,
@@ -70,10 +72,11 @@ uint64 emt64_msr[NR_EMT64MSR] = {
     IA32_KERNEL_GS_BASE
 };
 
-extern uint32 pw_reserved_bits_high_mask;
+extern uint32_t pw_reserved_bits_high_mask;
 
 static void vcpu_init(struct vcpu_t *vcpu);
 static void vcpu_prepare(struct vcpu_t *vcpu);
+static void vcpu_init_emulator(struct vcpu_t *vcpu);
 
 static void vmread_cr(struct vcpu_t *vcpu);
 static void vmwrite_cr(struct vcpu_t *vcpu);
@@ -102,19 +105,23 @@ static int null_handler(struct vcpu_t *vcpu, struct hax_tunnel *hun);
 static void advance_rip(struct vcpu_t *vcpu);
 static void handle_machine_check(struct vcpu_t *vcpu);
 
-static void handle_cpuid_virtual(struct vcpu_t *vcpu, uint32 eax, uint32 ecx);
+static void handle_cpuid_virtual(struct vcpu_t *vcpu, uint32_t eax, uint32_t ecx);
 static void handle_mem_fault(struct vcpu_t *vcpu, struct hax_tunnel *htun);
-static void check_flush(struct vcpu_t *vcpu, uint32 bits);
+static void check_flush(struct vcpu_t *vcpu, uint32_t bits);
 static void vmwrite_efer(struct vcpu_t *vcpu);
 
-static int handle_msr_read(struct vcpu_t *vcpu, uint32 msr, uint64 *val);
-static int handle_msr_write(struct vcpu_t *vcpu, uint32 msr, uint64 val);
+static int handle_msr_read(struct vcpu_t *vcpu, uint32_t msr, uint64_t *val);
+static int handle_msr_write(struct vcpu_t *vcpu, uint32_t msr, uint64_t val,
+                            bool by_host);
 static void handle_cpuid(struct vcpu_t *vcpu, struct hax_tunnel *htun);
-static void vcpu_dump(struct vcpu_t *vcpu, uint32 mask, const char *caption);
+static void vcpu_dump(struct vcpu_t *vcpu, uint32_t mask, const char *caption);
 static void vcpu_state_dump(struct vcpu_t *vcpu);
 static void vcpu_enter_fpu_state(struct vcpu_t *vcpu);
 
-static uint32 get_seg_present(uint32 seg)
+static int vcpu_set_apic_base(struct vcpu_t *vcpu, uint64_t val);
+static bool vcpu_is_bsp(struct vcpu_t *vcpu);
+
+static uint32_t get_seg_present(uint32_t seg)
 {
     mword ldtr_base;
     struct seg_desc_t *seg_desc;
@@ -132,7 +139,7 @@ static void fake_seg_gs_entry(struct hstate *hstate)
 {
     mword ldtr_base;
     struct seg_desc_t *seg_desc = NULL;
-    uint16 seg = hstate->gs;
+    uint16_t seg = hstate->gs;
 
     ldtr_base = get_kernel_ldtr_base();
     seg_desc = (struct seg_desc_t *)ldtr_base + (seg >> 3);
@@ -143,8 +150,8 @@ static void fake_seg_gs_entry(struct hstate *hstate)
     seg_desc->_raw = 0;
 }
 
-static void get_segment_desc_t(segment_desc_t *sdt, uint32 s, uint64 b,
-                               uint32 l, uint32 a)
+static void get_segment_desc_t(segment_desc_t *sdt, uint32_t s, uint64_t b,
+                               uint32_t l, uint32_t a)
 {
     sdt->selector = s;
     sdt->base = b;
@@ -152,23 +159,23 @@ static void get_segment_desc_t(segment_desc_t *sdt, uint32 s, uint64 b,
     sdt->ar = a;
 }
 
-static inline void set_gdt(struct vcpu_state_t *state, uint64 base,
-                           uint64 limit)
+static inline void set_gdt(struct vcpu_state_t *state, uint64_t base,
+                           uint64_t limit)
 {
     state->_gdt.base = base;
     state->_gdt.limit = limit;
 }
 
-static inline void set_idt(struct vcpu_state_t *state, uint64 base,
-                           uint64 limit)
+static inline void set_idt(struct vcpu_state_t *state, uint64_t base,
+                           uint64_t limit)
 {
     state->_idt.base = base;
     state->_idt.limit = limit;
 }
 
-static uint64 vcpu_read_cr(struct vcpu_state_t *state, uint32 n)
+static uint64_t vcpu_read_cr(struct vcpu_state_t *state, uint32_t n)
 {
-    uint64 val = 0;
+    uint64_t val = 0;
 
     switch (n) {
         case 0: {
@@ -188,19 +195,20 @@ static uint64 vcpu_read_cr(struct vcpu_state_t *state, uint32 n)
             break;
         }
         default: {
-            hax_error("Unsupported CR%d access\n", n);
+            hax_log(HAX_LOGW, "Ignored unsupported CR%d read, returning 0\n",
+                    n);
             break;
         }
     }
 
-    hax_debug("vcpu_read_cr cr %x val %llx\n", n, val);
+    hax_log(HAX_LOGD, "vcpu_read_cr cr %x val %llx\n", n, val);
 
     return val;
 }
 
-static void vcpu_write_cr(struct vcpu_state_t *state, uint32 n, uint64 val)
+static void vcpu_write_cr(struct vcpu_state_t *state, uint32_t n, uint64_t val)
 {
-    hax_debug("vcpu_write_cr cr %x val %llx\n", n, val);
+    hax_log(HAX_LOGD, "vcpu_write_cr cr %x val %llx\n", n, val);
 
     switch (n) {
         case 0: {
@@ -220,7 +228,7 @@ static void vcpu_write_cr(struct vcpu_state_t *state, uint32 n, uint64 val)
             break;
         }
         default: {
-            hax_error("write_cr: Unsupported CR%d access\n", n);
+            hax_log(HAX_LOGE, "write_cr: Unsupported CR%d access\n", n);
             break;
         }
     }
@@ -231,7 +239,7 @@ void * vcpu_vmcs_va(struct vcpu_t *vcpu)
     return hax_page_va(vcpu->vmcs_page);
 }
 
-paddr_t vcpu_vmcs_pa(struct vcpu_t *vcpu)
+hax_paddr_t vcpu_vmcs_pa(struct vcpu_t *vcpu)
 {
     return hax_page_pa(vcpu->vmcs_page);
 }
@@ -261,7 +269,7 @@ int set_vcpu_host(struct vcpu_t *vcpu, void *vcpu_host)
 }
 
 int set_vcpu_tunnel(struct vcpu_t *vcpu, struct hax_tunnel *tunnel,
-                    uint8 *iobuf)
+                    uint8_t *iobuf)
 {
     if (!vcpu || (vcpu->tunnel && tunnel && vcpu->tunnel != tunnel) ||
             (vcpu->io_buf && iobuf && vcpu->io_buf != iobuf))
@@ -291,26 +299,27 @@ struct hax_tunnel * get_vcpu_tunnel(struct vcpu_t *vcpu)
  */
 static int vcpu_vpid_alloc(struct vcpu_t *vcpu)
 {
-    uint32 vpid_seed_bits = sizeof(vcpu->vm->vpid_seed) * 8;
-    uint8 bit, max_bit;
+    uint32_t vpid_seed_bits = sizeof(vcpu->vm->vpid_seed) * 8;
+    uint8_t bit, max_bit;
 
     max_bit = vpid_seed_bits > 0xff ? 0xff : vpid_seed_bits;
 
     if (0 != vcpu->vpid) {
-        hax_warning("vcpu_vpid_alloc: vcpu %u in vm %d already has a valid "
-                    "VPID 0x%x.\n", vcpu->vcpu_id, vcpu->vm->vm_id, vcpu->vpid);
+        hax_log(HAX_LOGW, "vcpu_vpid_alloc: vcpu %u in vm %d already has a "
+                "valid VPID 0x%x.\n", vcpu->vcpu_id, vcpu->vm->vm_id,
+                vcpu->vpid);
         return -1;
     }
 
     for (bit = 0; bit < max_bit; bit++) {
-        if (!hax_test_and_set_bit(bit, (uint64 *)vcpu->vm->vpid_seed))
+        if (!hax_test_and_set_bit(bit, (uint64_t *)vcpu->vm->vpid_seed))
             break;
     }
 
     if (bit == max_bit) {
         // No available VPID resource
-        hax_error("vcpu_vpid_alloc: no available vpid resource. vcpu: %u, "
-                  "vm: %d\n", vcpu->vcpu_id, vcpu->vm->vm_id);
+        hax_log(HAX_LOGE, "vcpu_vpid_alloc: no available vpid resource. "
+                "vcpu: %u, vm: %d\n", vcpu->vcpu_id, vcpu->vm->vm_id);
         return -2;
     }
 
@@ -321,9 +330,9 @@ static int vcpu_vpid_alloc(struct vcpu_t *vcpu)
      * byte.
      * Note: vpid can't be zero.
      */
-    vcpu->vpid = (uint16)(vcpu->vm->vm_id << 8) + (uint16)(bit + 1);
-    hax_info("vcpu_vpid_alloc: succeed! vpid: 0x%x. vcpu_id: %u, vm_id: %d.\n",
-             vcpu->vpid, vcpu->vcpu_id, vcpu->vm->vm_id);
+    vcpu->vpid = (uint16_t)(vcpu->vm->vm_id << 8) + (uint16_t)(bit + 1);
+    hax_log(HAX_LOGI, "vcpu_vpid_alloc: succeed! vpid: 0x%x. vcpu_id: %u, "
+            "vm_id: %d.\n", vcpu->vpid, vcpu->vcpu_id, vcpu->vm->vm_id);
 
     return 0;
 }
@@ -340,21 +349,21 @@ static int vcpu_vpid_alloc(struct vcpu_t *vcpu)
  */
 static int vcpu_vpid_free(struct vcpu_t *vcpu)
 {
-    uint8 bit = (vcpu->vpid & 0xff) - 1;
+    uint8_t bit = (vcpu->vpid & 0xff) - 1;
 
     if (0 == vcpu->vpid) {
-        hax_warning("vcpu_vpid_free: vcpu %u in vm %d does not have a valid "
-                    "VPID.\n", vcpu->vcpu_id, vcpu->vm->vm_id);
+        hax_log(HAX_LOGW, "vcpu_vpid_free: vcpu %u in vm %d does not have a "
+                "valid VPID.\n", vcpu->vcpu_id, vcpu->vm->vm_id);
         return -1;
     }
 
-    hax_info("vcpu_vpid_free: Clearing bit: 0x%x, vpid_seed: 0x%llx. "
-             "vcpu_id: %u, vm_id: %d.\n", bit, *(uint64 *)vcpu->vm->vpid_seed,
-             vcpu->vcpu_id, vcpu->vm->vm_id);
-    if (0 != hax_test_and_clear_bit(bit, (uint64 *)(vcpu->vm->vpid_seed))) {
-        hax_warning("vcpu_vpid_free: bit for vpid 0x%x of vcpu %u in vm %d was "
-                    "already clear.\n", vcpu->vpid, vcpu->vcpu_id,
-                    vcpu->vm->vm_id);
+    hax_log(HAX_LOGI, "vcpu_vpid_free: Clearing bit: 0x%x, vpid_seed: 0x%llx. "
+            "vcpu_id: %u, vm_id: %d.\n", bit, *(uint64_t *)vcpu->vm->vpid_seed,
+            vcpu->vcpu_id, vcpu->vm->vm_id);
+    if (0 != hax_test_and_clear_bit(bit, (uint64_t *)(vcpu->vm->vpid_seed))) {
+        hax_log(HAX_LOGW, "vcpu_vpid_free: bit for vpid 0x%x of vcpu %u in vm "
+                "%d was already clear.\n", vcpu->vpid, vcpu->vcpu_id,
+                vcpu->vm->vm_id);
     }
     vcpu->vpid = 0;
 
@@ -362,31 +371,23 @@ static int vcpu_vpid_free(struct vcpu_t *vcpu)
 }
 
 static int (*handler_funcs[])(struct vcpu_t *vcpu, struct hax_tunnel *htun) = {
-    exit_exc_nmi,
-    exit_interrupt,
-    exit_triple_fault,
-    0, 0, 0, 0,
-    exit_interrupt_window,                      // Interrupt window
-    exit_interrupt_window,                      // NMI window
-    0,
-    exit_cpuid,
-    0,
-    exit_hlt,
-    0,
-    exit_invlpg,
-    0,
-    exit_rdtsc,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,            // 17 ... 27
-    exit_cr_access,
-    exit_dr_access,
-    exit_io_access,
-    exit_msr_read,
-    exit_msr_write,
-    exit_invalid_guest_state,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // 34 ... 47
-    exit_ept_violation,
-    exit_ept_misconfiguration,
-    0, 0, 0, 0, 0, 0                            // 50 ... 55
+    [VMX_EXIT_INT_EXCEPTION_NMI]  = exit_exc_nmi,
+    [VMX_EXIT_EXT_INTERRUPT]      = exit_interrupt,
+    [VMX_EXIT_TRIPLE_FAULT]       = exit_triple_fault,
+    [VMX_EXIT_PENDING_INTERRUPT]  = exit_interrupt_window,
+    [VMX_EXIT_PENDING_NMI]        = exit_interrupt_window,
+    [VMX_EXIT_CPUID]              = exit_cpuid,
+    [VMX_EXIT_HLT]                = exit_hlt,
+    [VMX_EXIT_INVLPG]             = exit_invlpg,
+    [VMX_EXIT_RDTSC]              = exit_rdtsc,
+    [VMX_EXIT_CR_ACCESS]          = exit_cr_access,
+    [VMX_EXIT_DR_ACCESS]          = exit_dr_access,
+    [VMX_EXIT_IO]                 = exit_io_access,
+    [VMX_EXIT_MSR_READ]           = exit_msr_read,
+    [VMX_EXIT_MSR_WRITE]          = exit_msr_write,
+    [VMX_EXIT_FAILED_VMENTER_GS]  = exit_invalid_guest_state,
+    [VMX_EXIT_EPT_VIOLATION]      = exit_ept_violation,
+    [VMX_EXIT_EPT_MISCONFIG]      = exit_ept_misconfiguration,
 };
 
 static int nr_handlers = ARRAY_ELEMENTS(handler_funcs);
@@ -396,7 +397,7 @@ struct vcpu_t *vcpu_create(struct vm_t *vm, void *vm_host, int vcpu_id)
     struct hax_tunnel_info info;
     struct vcpu_t *vcpu;
 
-    hax_debug("vcpu_create vcpu_id %x\n", vcpu_id);
+    hax_log(HAX_LOGD, "vcpu_create vcpu_id %x\n", vcpu_id);
 
     if (!valid_vcpu_id(vcpu_id))
         return NULL;
@@ -410,7 +411,7 @@ struct vcpu_t *vcpu_create(struct vm_t *vm, void *vm_host, int vcpu_id)
     memset(vcpu, 0, sizeof(struct vcpu_t));
 
     if (hax_vcpu_setup_hax_tunnel(vcpu, &info) < 0) {
-        hax_error("HAX: cannot setup hax_tunnel for vcpu.\n");
+        hax_log(HAX_LOGE, "cannot setup hax_tunnel for vcpu.\n");
         goto fail_1;
     }
 
@@ -441,6 +442,7 @@ struct vcpu_t *vcpu_create(struct vm_t *vm, void *vm_host, int vcpu_id)
     if (hax_vcpu_create_host(vcpu, vm_host, vm->vm_id, vcpu_id))
         goto fail_7;
 
+    vcpu->prev_cpu_id = -1;
     vcpu->cpu_id = hax_cpuid();
     vcpu->vcpu_id = vcpu_id;
     vcpu->is_running = 0;
@@ -454,6 +456,8 @@ struct vcpu_t *vcpu_create(struct vm_t *vm, void *vm_host, int vcpu_id)
     // First time vmclear/vmptrld on current CPU
     vcpu_prepare(vcpu);
 
+
+
     // Publish the vcpu
     hax_mutex_lock(vm->vm_lock);
     hax_list_add(&vcpu->vcpu_list, &vm->vcpu_list);
@@ -461,7 +465,10 @@ struct vcpu_t *vcpu_create(struct vm_t *vm, void *vm_host, int vcpu_id)
     hax_atomic_add(&vm->ref_count, 1);
     hax_mutex_unlock(vm->vm_lock);
 
-    hax_debug("HAX: vcpu %d is created.\n", vcpu->vcpu_id);
+    // Initialize emulator
+    vcpu_init_emulator(vcpu);
+
+    hax_log(HAX_LOGD, "vcpu %d is created.\n", vcpu->vcpu_id);
     return vcpu;
 fail_7:
     vcpu_vtlb_free(vcpu);
@@ -480,7 +487,7 @@ fail_2:
 fail_1:
     hax_vfree(vcpu, sizeof(struct vcpu_t));
 fail_0:
-    hax_error("HAX: Cannot allocate memory to create vcpu.\n");
+    hax_log(HAX_LOGE, "Cannot allocate memory to create vcpu.\n");
     return NULL;
 }
 
@@ -521,7 +528,7 @@ static int _vcpu_teardown(struct vcpu_t *vcpu)
     hax_mutex_free(vcpu->tmutex);
     hax_vfree(vcpu, sizeof(struct vcpu_t));
 
-    hax_info("HAX: vcpu %d is teardown.\n", vcpu_id);
+    hax_log(HAX_LOGI, "vcpu %d is teardown.\n", vcpu_id);
     return 0;
 }
 
@@ -545,6 +552,8 @@ static void vcpu_init(struct vcpu_t *vcpu)
 {
     // TODO: Need to decide which mode guest will start
     struct vcpu_state_t *state = vcpu->state;
+    int i;
+
     hax_mutex_lock(vcpu->tmutex);
 
     // TODO: mtrr ?
@@ -559,7 +568,7 @@ static void vcpu_init(struct vcpu_t *vcpu)
 
     vcpu->ref_count = 1;
 
-    vcpu->tsc_offset = 0ULL - rdtsc();
+    vcpu->tsc_offset = 0ULL - ia32_rdtsc();
 
     // Prepare the vcpu state to Power-up
     state->_rflags = 2;
@@ -578,8 +587,32 @@ static void vcpu_init(struct vcpu_t *vcpu)
     get_segment_desc_t(&state->_tr, 0, 0, 0xffff, 0x83);
 
     state->_dr0 = state->_dr1 = state->_dr2 = state->_dr3 = 0x0;
-    state->_dr6 = 0xffff0ff0;
-    state->_dr7 = 0x00000400;
+    state->_dr6 = DR6_SETBITS;
+    state->_dr7 = DR7_SETBITS;
+    vcpu->dr_dirty = 1;
+
+    // Initialize guest MSR state, i.e. a list of MSRs and their initial values.
+    // Note that all zeros is not a valid state (see below). At the first VM
+    // entry, these MSRs will be loaded with these values, unless QEMU has
+    // overridden them using HAX_VCPU_IOCTL_SET_MSRS.
+    // TODO: Enable hardware-assisted MSR save/restore (cf. IA SDM Vol. 3C
+    // 31.10.2-31.10.3: Using VM-Exit/VM-Entry Controls for MSRs).
+    for (i = 0; i < NR_GMSR; i++) {
+        // Without this initialization, |entry| defaults to 0, which is also
+        // a valid MSR (IA32_P5_MC_ADDR, often implemented as an alias for
+        // IA32_MC0_CTL), but which is not one that HAXM should tamper with.
+        // In fact, writing 0 to it has serious consequences, including
+        // disabling SGX (cf. IA SDM Vol. 3D 42.15.2: Machine Check Enables).
+        vcpu->gstate.gmsr[i].entry = gmsr_list[i];
+        // 0 is an appropriate initial value for all MSRs in gmsr_list[]
+        vcpu->gstate.gmsr[i].value = 0;
+    }
+
+    // Initialize IA32_APIC_BASE MSR
+    vcpu->gstate.apic_base = APIC_BASE_DEFAULT_ADDR | APIC_BASE_ENABLE;
+    if (vcpu_is_bsp(vcpu)) {
+        vcpu->gstate.apic_base |= APIC_BASE_BSP;
+    }
 
     hax_mutex_unlock(vcpu->tmutex);
 }
@@ -592,7 +625,7 @@ static int check_panic(void)
 }
 
 // Code to check the host state between vmluanch and vmexit
-static uint32 get_seg_avail(uint32 seg)
+static uint32_t get_seg_avail(uint32_t seg)
 {
     mword gdtr_base;
     struct seg_desc_t *sd;
@@ -603,17 +636,17 @@ static uint32 get_seg_avail(uint32 seg)
     return sd->_avl;
 }
 
-static void dump_segment(uint32 seg)
+static void dump_segment(uint32_t seg)
 {
     struct seg_desc_t *sd;
     mword gdtr_base;
 
     gdtr_base = get_kernel_gdtr_base();
     sd = (struct seg_desc_t *)gdtr_base + (seg >> 3);
-    hax_debug("seg %x value %llx\n", seg, sd->_raw);
+    hax_log(HAX_LOGD, "seg %x value %llx\n", seg, sd->_raw);
 }
 
-static int check_cs(uint32 seg)
+static int check_cs(uint32_t seg)
 {
     mword gdtr_base;
     mword desc_base;
@@ -643,7 +676,7 @@ static int check_cs(uint32 seg)
     return 0;
 }
 
-static int check_data_seg(uint32 seg)
+static int check_data_seg(uint32_t seg)
 {
     mword gdtr_base;
     mword desc_base;
@@ -676,7 +709,7 @@ static int check_data_seg(uint32 seg)
     return 0;
 }
 
-static int check_stack_seg(uint32 seg)
+static int check_stack_seg(uint32_t seg)
 {
     mword gdtr_base;
     mword desc_base;
@@ -707,7 +740,7 @@ static int check_stack_seg(uint32 seg)
     return 0;
 }
 
-static int check_tr_seg(uint32 seg)
+static int check_tr_seg(uint32_t seg)
 {
     mword gdtr_base;
     struct seg_desc_t *sd;
@@ -737,7 +770,7 @@ static int check_tr_seg(uint32 seg)
     return 0;
 }
 
-static int check_fgs_seg(uint32 seg, uint fs)
+static int check_fgs_seg(uint32_t seg, uint fs)
 {
     mword gdtr_base;
     mword desc_base;
@@ -745,7 +778,7 @@ static int check_fgs_seg(uint32 seg, uint fs)
     mword base;
 
     if (seg == 0) {
-        hax_debug("fgs_seg seg is %x fs %x\n", seg, fs);
+        hax_log(HAX_LOGD, "fgs_seg seg is %x fs %x\n", seg, fs);
         return 0;
     }
     gdtr_base = get_kernel_gdtr_base();
@@ -759,8 +792,8 @@ static int check_fgs_seg(uint32 seg, uint fs)
 
     if ((base & 0xffffff) != sd->_base0 ||
         ((base >> 24) & 0xff) != sd->_base1) {
-        // hax_debug("%s base address mismatch base %llx sd %llx\n",
-        //           fs ? "fs" : "gs", base, sd->_raw);
+        // hax_log(HAX_LOGD, "%s base address mismatch base %llx sd %llx\n",
+        //         fs ? "fs" : "gs", base, sd->_raw);
         // return 1;
         return 0;
     }
@@ -788,7 +821,7 @@ static int check_fgs_seg(uint32 seg, uint fs)
 
 int vcpu_get_host_state(struct vcpu_t *vcpu, int pre)
 {
-    uint64 value;
+    uint64_t value;
     struct host_state_compare *hsc;
     hsc = pre ? &vcpu->hsc_pre : &vcpu->hsc_post;
     memset(hsc, 0, sizeof(struct host_state_compare));
@@ -829,33 +862,33 @@ int vcpu_get_host_state(struct vcpu_t *vcpu, int pre)
 
     if (pre) {
         if (check_cs(hsc->cs)) {
-            hax_debug("CS does not pass the check.\n");
+            hax_log(HAX_LOGD, "CS does not pass the check.\n");
             dump_segment(hsc->cs);
             // check_panic();
         }
         if (check_stack_seg(hsc->ss)) {
-            hax_debug("SS does not pass the check.\n");
+            hax_log(HAX_LOGD, "SS does not pass the check.\n");
             dump_segment(hsc->ss);
             // check_panic();
         }
         if (check_fgs_seg(hsc->fs, 1)) {
-            hax_debug("FS does not pass the check.\n");
+            hax_log(HAX_LOGD, "FS does not pass the check.\n");
             dump_segment(hsc->fs);
             // check_panic();
         }
         if (check_fgs_seg(hsc->gs, 0)) {
-            hax_debug("GS does not pass the check.\n");
+            hax_log(HAX_LOGD, "GS does not pass the check.\n");
             dump_segment(hsc->gs);
             // check_panic();
         }
         if (check_data_seg(hsc->ds) || check_data_seg(hsc->es)) {
-            hax_debug("DS or ES does not pass the check.\n");
+            hax_log(HAX_LOGD, "DS or ES does not pass the check.\n");
             dump_segment(hsc->ds);
             dump_segment(hsc->es);
             // check_panic();
         }
         if (check_tr_seg(hsc->tr)) {
-            hax_debug("TR does not pass the check.\n");
+            hax_log(HAX_LOGD, "TR does not pass the check.\n");
             dump_segment(hsc->tr);
             // check_panic();
         }
@@ -875,7 +908,7 @@ int compare_host_state(struct vcpu_t *vcpu)
     pre = &vcpu->hsc_pre;
     post = &vcpu->hsc_post;
     if (memcmp(pre, post, sizeof(struct host_state_compare))) {
-        hax_debug("The previous and next is not same.\n");
+        hax_log(HAX_LOGD, "The previous and next is not same.\n");
         dump_hsc_state(pre);
         dump_hsc_state(post);
         check_panic();
@@ -884,7 +917,7 @@ int compare_host_state(struct vcpu_t *vcpu)
 }
 #endif
 
-static int is_emt64_msr(uint64 entry)
+static int is_emt64_msr(uint64_t entry)
 {
     int i = 0;
     for (i = 0; i < NR_EMT64MSR; i++) {
@@ -898,12 +931,17 @@ void save_guest_msr(struct vcpu_t *vcpu)
 {
     int i;
     struct gstate *gstate = &vcpu->gstate;
+    bool em64t_support = cpu_has_feature(X86_FEATURE_EM64T);
 
     for (i = 0; i < NR_GMSR; i++) {
         gstate->gmsr[i].entry = gmsr_list[i];
-        if (cpu_has_emt64_support() || !is_emt64_msr(gmsr_list[i])) {
+        if (em64t_support || !is_emt64_msr(gmsr_list[i])) {
             gstate->gmsr[i].value = ia32_rdmsr(gstate->gmsr[i].entry);
         }
+    }
+
+    if (cpu_has_feature(X86_FEATURE_RDTSCP)) {
+        gstate->tsc_aux = ia32_rdmsr(IA32_TSC_AUX);
     }
 
     if (!hax->apm_version)
@@ -911,9 +949,9 @@ void save_guest_msr(struct vcpu_t *vcpu)
 
     // APM v1: save IA32_PMCx and IA32_PERFEVTSELx
     for (i = 0; i < (int)hax->apm_general_count; i++) {
-        uint32 msr = (uint32)(IA32_PMC0 + i);
+        uint32_t msr = (uint32_t)(IA32_PMC0 + i);
         gstate->apm_pmc_msrs[i] = ia32_rdmsr(msr);
-        msr = (uint32)(IA32_PERFEVTSEL0 + i);
+        msr = (uint32_t)(IA32_PERFEVTSEL0 + i);
         gstate->apm_pes_msrs[i] = ia32_rdmsr(msr);
     }
 }
@@ -922,11 +960,16 @@ void load_guest_msr(struct vcpu_t *vcpu)
 {
     int i;
     struct gstate *gstate = &vcpu->gstate;
+    bool em64t_support = cpu_has_feature(X86_FEATURE_EM64T);
 
     for (i = 0; i < NR_GMSR; i++) {
-        if (cpu_has_emt64_support() || !is_emt64_msr(gstate->gmsr[i].entry)) {
+        if (em64t_support || !is_emt64_msr(gstate->gmsr[i].entry)) {
             ia32_wrmsr(gstate->gmsr[i].entry, gstate->gmsr[i].value);
         }
+    }
+
+    if (cpu_has_feature(X86_FEATURE_RDTSCP)) {
+        ia32_wrmsr(IA32_TSC_AUX, gstate->tsc_aux);
     }
 
     if (!hax->apm_version)
@@ -934,9 +977,9 @@ void load_guest_msr(struct vcpu_t *vcpu)
 
     // APM v1: restore IA32_PMCx and IA32_PERFEVTSELx
     for (i = 0; i < (int)hax->apm_general_count; i++) {
-        uint32 msr = (uint32)(IA32_PMC0 + i);
+        uint32_t msr = (uint32_t)(IA32_PMC0 + i);
         ia32_wrmsr(msr, gstate->apm_pmc_msrs[i]);
-        msr = (uint32)(IA32_PERFEVTSEL0 + i);
+        msr = (uint32_t)(IA32_PERFEVTSEL0 + i);
         ia32_wrmsr(msr, gstate->apm_pes_msrs[i]);
     }
 }
@@ -945,12 +988,17 @@ static void save_host_msr(struct vcpu_t *vcpu)
 {
     int i;
     struct hstate *hstate = &get_cpu_data(vcpu->cpu_id)->hstate;
+    bool em64t_support = cpu_has_feature(X86_FEATURE_EM64T);
 
     for (i = 0; i < NR_HMSR; i++) {
         hstate->hmsr[i].entry = hmsr_list[i];
-        if (cpu_has_emt64_support() || !is_emt64_msr(hmsr_list[i])) {
+        if (em64t_support || !is_emt64_msr(hmsr_list[i])) {
             hstate->hmsr[i].value = ia32_rdmsr(hstate->hmsr[i].entry);
         }
+    }
+
+    if (cpu_has_feature(X86_FEATURE_RDTSCP)) {
+        hstate->tsc_aux = ia32_rdmsr(IA32_TSC_AUX);
     }
 
     if (!hax->apm_version)
@@ -958,9 +1006,9 @@ static void save_host_msr(struct vcpu_t *vcpu)
 
     // APM v1: save IA32_PMCx and IA32_PERFEVTSELx
     for (i = 0; i < (int)hax->apm_general_count; i++) {
-        uint32 msr = (uint32)(IA32_PMC0 + i);
+        uint32_t msr = (uint32_t)(IA32_PMC0 + i);
         hstate->apm_pmc_msrs[i] = ia32_rdmsr(msr);
-        msr = (uint32)(IA32_PERFEVTSEL0 + i);
+        msr = (uint32_t)(IA32_PERFEVTSEL0 + i);
         hstate->apm_pes_msrs[i] = ia32_rdmsr(msr);
     }
 }
@@ -969,11 +1017,16 @@ static void load_host_msr(struct vcpu_t *vcpu)
 {
     int i;
     struct hstate *hstate = &get_cpu_data(vcpu->cpu_id)->hstate;
+    bool em64t_support = cpu_has_feature(X86_FEATURE_EM64T);
 
     for (i = 0; i < NR_HMSR; i++) {
-        if (cpu_has_emt64_support() || !is_emt64_msr(hstate->hmsr[i].entry)) {
+        if (em64t_support || !is_emt64_msr(hstate->hmsr[i].entry)) {
             ia32_wrmsr(hstate->hmsr[i].entry, hstate->hmsr[i].value);
         }
+    }
+
+    if (cpu_has_feature(X86_FEATURE_RDTSCP)) {
+        ia32_wrmsr(IA32_TSC_AUX, hstate->tsc_aux);
     }
 
     if (!hax->apm_version)
@@ -981,11 +1034,140 @@ static void load_host_msr(struct vcpu_t *vcpu)
 
     // APM v1: restore IA32_PMCx and IA32_PERFEVTSELx
     for (i = 0; i < (int)hax->apm_general_count; i++) {
-        uint32 msr = (uint32)(IA32_PMC0 + i);
+        uint32_t msr = (uint32_t)(IA32_PMC0 + i);
         ia32_wrmsr(msr, hstate->apm_pmc_msrs[i]);
-        msr = (uint32)(IA32_PERFEVTSEL0 + i);
+        msr = (uint32_t)(IA32_PERFEVTSEL0 + i);
         ia32_wrmsr(msr, hstate->apm_pes_msrs[i]);
     }
+}
+
+static inline bool is_host_debug_enabled(struct vcpu_t *vcpu)
+{
+    struct hstate *hstate = &get_cpu_data(vcpu->cpu_id)->hstate;
+
+    return !!(hstate->dr7 & HBREAK_ENABLED_MASK);
+}
+
+static inline bool is_thread_migrated(struct vcpu_t *vcpu)
+{
+    /*
+     * Sometimes current thread might be migrated to other CPU core. In this
+     * case, registers might be different with them in original core.
+     * This function is to check thread is migrated or not.
+     */
+    return (vcpu->cpu_id != vcpu->prev_cpu_id);
+}
+
+static void load_dirty_vmcs_fields(struct vcpu_t *vcpu)
+{
+    struct vcpu_state_t *state = vcpu->state;
+
+    // rflags
+    if (vcpu->debug_control_dirty) {
+        // Single-stepping
+        if (vcpu->debug_control & HAX_DEBUG_STEP) {
+            state->_rflags |= EFLAGS_TF;
+        } else {
+            state->_rflags &= ~EFLAGS_TF;
+        }
+        vcpu->rflags_dirty = 1;
+        vcpu->debug_control_dirty = 0;
+    }
+    if (vcpu->rflags_dirty) {
+        vmwrite(vcpu, GUEST_RFLAGS, state->_rflags);
+        vcpu->rflags_dirty = 0;
+    }
+
+    // interruptibility
+    if (vcpu->interruptibility_dirty) {
+        vmwrite(vcpu, GUEST_INTERRUPTIBILITY,
+                vmx(vcpu, interruptibility_state).raw);
+        vcpu->interruptibility_dirty = 0;
+    }
+
+    // rip
+    if (vcpu->rip_dirty) {
+        vmwrite(vcpu, GUEST_RIP, state->_rip);
+        vcpu->rip_dirty = 0;
+    }
+
+    // primary cpu ctrl
+    if (vcpu->pcpu_ctls_dirty) {
+        vmwrite(vcpu, VMX_PRIMARY_PROCESSOR_CONTROLS, vmx(vcpu, pcpu_ctls));
+        vcpu->pcpu_ctls_dirty = 0;
+    }
+
+    // FS base
+    if (vcpu->fs_base_dirty) {
+        vmwrite(vcpu, GUEST_FS_BASE, vcpu->state->_fs.base);
+        vcpu->fs_base_dirty = 0;
+    }
+}
+
+static inline bool is_guest_dr_dirty(struct vcpu_t *vcpu)
+{
+    return (vcpu->dr_dirty || is_thread_migrated(vcpu));
+}
+
+static void save_guest_dr(struct vcpu_t *vcpu)
+{
+    struct vcpu_state_t *state = vcpu->state;
+
+    /*
+     * Only dr6 needs to be saved. Guest couldn't change dr registers directly
+     * except for dr6. Guest writing dr is captured by exit_dr_access, and
+     * saved in guest state dr.
+     */
+    state->_dr6 = get_dr6();
+}
+
+static void load_guest_dr(struct vcpu_t *vcpu)
+{
+    struct vcpu_state_t *state = vcpu->state;
+
+    if (!(is_guest_dr_dirty(vcpu) || is_host_debug_enabled(vcpu)))
+        return;
+
+    set_dr0(state->_dr0);
+    set_dr1(state->_dr1);
+    set_dr2(state->_dr2);
+    set_dr3(state->_dr3);
+    set_dr6(state->_dr6);
+    vmwrite(vcpu, GUEST_DR7, state->_dr7);
+
+    vcpu->dr_dirty = 0;
+}
+
+static void save_host_dr(struct vcpu_t *vcpu)
+{
+    struct hstate *hstate = &get_cpu_data(vcpu->cpu_id)->hstate;
+
+    // dr7 is used to check host debugging enabled or not
+    hstate->dr7 = get_dr7();
+
+    if (!is_host_debug_enabled(vcpu))
+        return;
+
+    hstate->dr0 = get_dr0();
+    hstate->dr1 = get_dr1();
+    hstate->dr2 = get_dr2();
+    hstate->dr3 = get_dr3();
+    hstate->dr6 = get_dr6();
+}
+
+static void load_host_dr(struct vcpu_t *vcpu)
+{
+    struct hstate *hstate = &get_cpu_data(vcpu->cpu_id)->hstate;
+
+    if (!is_host_debug_enabled(vcpu))
+        return;
+
+    set_dr0(hstate->dr0);
+    set_dr1(hstate->dr1);
+    set_dr2(hstate->dr2);
+    set_dr3(hstate->dr3);
+    set_dr6(hstate->dr6);
+    set_dr7(hstate->dr7);
 }
 
 void vcpu_save_host_state(struct vcpu_t *vcpu)
@@ -994,8 +1176,8 @@ void vcpu_save_host_state(struct vcpu_t *vcpu)
 
     // In case we do not know the specific operations with different OSes,
     // we save all of them at the initial time
-    uint16 gs = get_kernel_gs();
-    uint16 fs = get_kernel_fs();
+    uint16_t gs = get_kernel_gs();
+    uint16_t fs = get_kernel_fs();
 
     get_kernel_gdt(&hstate->host_gdtr);
     get_kernel_idt(&hstate->host_idtr);
@@ -1009,7 +1191,7 @@ void vcpu_save_host_state(struct vcpu_t *vcpu)
         vmwrite(vcpu, HOST_EFER, hstate->_efer);
     }
 
-#ifdef __x86_64__
+#ifdef HAX_ARCH_X86_64
     vmwrite(vcpu, HOST_CS_SELECTOR, get_kernel_cs());
 #else
     if (is_compatible()) {  // compatible
@@ -1022,7 +1204,7 @@ void vcpu_save_host_state(struct vcpu_t *vcpu)
     vmwrite(vcpu, HOST_SS_SELECTOR, get_kernel_ss() & 0xfff8);
 
     if (get_kernel_ss() & 0x7) {
-        hax_debug("Kernel SS %x with 0x7\n", get_kernel_ss());
+        hax_log(HAX_LOGD, "Kernel SS %x with 0x7\n", get_kernel_ss());
     }
 
     vmwrite(vcpu, HOST_DS_SELECTOR, get_kernel_ds() & 0xfff8);
@@ -1052,7 +1234,7 @@ void vcpu_save_host_state(struct vcpu_t *vcpu)
         vmwrite(vcpu, HOST_GS_SELECTOR, 0);
     } else {
         vmwrite(vcpu, HOST_GS_SELECTOR, gs);
-#ifdef __x86_64__
+#ifdef HAX_ARCH_X86_64
         // For ia32e mode, the MSR holds the base 3.4.4
         vmwrite(vcpu, HOST_GS_BASE, ia32_rdmsr(IA32_GS_BASE));
 #else
@@ -1066,14 +1248,14 @@ void vcpu_save_host_state(struct vcpu_t *vcpu)
     }
 
     if (fs & 0x7) {
-        hax_debug("fs %x\n", fs);
+        hax_log(HAX_LOGD, "fs %x\n", fs);
         hstate->fs = fs;
         hstate->fs_base = ia32_rdmsr(IA32_FS_BASE);
         hstate->seg_valid |= HOST_SEG_VALID_FS;
         vmwrite(vcpu, HOST_FS_SELECTOR, 0);
     } else {
         vmwrite(vcpu, HOST_FS_SELECTOR, fs);
-#ifdef __x86_64__
+#ifdef HAX_ARCH_X86_64
         // For ia32e mode, the MSR holds the base 3.4.4
         vmwrite(vcpu, HOST_FS_BASE, ia32_rdmsr(IA32_FS_BASE));
 #else
@@ -1106,20 +1288,36 @@ void vcpu_save_host_state(struct vcpu_t *vcpu)
     save_host_msr(vcpu);
 
     hstate->hcr2 = get_cr2();
+
+    save_host_dr(vcpu);
+
     vcpu_enter_fpu_state(vcpu);
     // CR0 should be written after host fpu state is saved
     vmwrite(vcpu, HOST_CR0, get_cr0());
 }
 
+static void vcpu_update_exception_bitmap(struct vcpu_t *vcpu)
+{
+    uint32_t exc_bitmap;
+
+    exc_bitmap = (1u << VECTOR_MC);
+    if (vcpu->debug_control & (HAX_DEBUG_USE_HW_BP | HAX_DEBUG_STEP)) {
+        exc_bitmap |= (1u << VECTOR_DB);
+    }
+    if (vcpu->debug_control & HAX_DEBUG_USE_SW_BP) {
+        exc_bitmap |= (1u << VECTOR_BP);
+    }
+    vmwrite(vcpu, VMX_EXCEPTION_BITMAP, exc_bitmap);
+}
+
 static void fill_common_vmcs(struct vcpu_t *vcpu)
 {
-    uint32 pin_ctls;
-    uint32 pcpu_ctls;
-    uint32 scpu_ctls;
-    uint32 exc_bitmap;
-    uint32 exit_ctls = 0;
-    uint32 entry_ctls;
-    uint32 vmcs_err = 0;
+    uint32_t pin_ctls;
+    uint32_t pcpu_ctls;
+    uint32_t scpu_ctls;
+    uint32_t exit_ctls = 0;
+    uint32_t entry_ctls;
+    uint32_t vmcs_err = 0;
     uint i;
     preempt_flag flags;
     struct per_cpu_data *cpu_data;
@@ -1127,11 +1325,18 @@ static void fill_common_vmcs(struct vcpu_t *vcpu)
     // How to determine the capability
     pin_ctls = EXT_INTERRUPT_EXITING | NMI_EXITING;
 
-    pcpu_ctls = IO_BITMAP_ACTIVE | MSR_BITMAP_ACTIVE |
+    pcpu_ctls = IO_BITMAP_ACTIVE | MSR_BITMAP_ACTIVE | DR_EXITING |
                 INTERRUPT_WINDOW_EXITING | USE_TSC_OFFSETTING | HLT_EXITING |
-                SECONDARY_CONTROLS;
+                CR8_LOAD_EXITING | CR8_STORE_EXITING | SECONDARY_CONTROLS;
 
     scpu_ctls = ENABLE_EPT;
+
+    // Make the RDTSCP instruction available to the guest if the host supports
+    // it (cf. Intel SDM Vol. 3C Table 24-7, bit 3: Enable RDTSCP)
+    if (cpu_has_feature(X86_FEATURE_RDTSCP)) {
+        // TODO: Check VMX capabilities to ensure ENABLE_RDTSCP is available
+        scpu_ctls |= ENABLE_RDTSCP;
+    }
 
     // If UG exists, we want it.
     if (hax->ug_enable_flag) {
@@ -1140,9 +1345,9 @@ static void fill_common_vmcs(struct vcpu_t *vcpu)
 
     // If vpid exists, we want it.
     if ((ia32_rdmsr(IA32_VMX_PROCBASED_CTLS) &
-        ((uint64)SECONDARY_CONTROLS << 32)) != 0) {
+        ((uint64_t)SECONDARY_CONTROLS << 32)) != 0) {
         if ((ia32_rdmsr(IA32_VMX_SECONDARY_CTLS) &
-            ((uint64)ENABLE_VPID << 32)) != 0) {
+            ((uint64_t)ENABLE_VPID << 32)) != 0) {
             if (0 != vcpu->vpid) {
                 scpu_ctls |= ENABLE_VPID;
                 vmwrite(vcpu, VMX_VPID, vcpu->vpid);
@@ -1150,14 +1355,12 @@ static void fill_common_vmcs(struct vcpu_t *vcpu)
         }
     }
 
-    exc_bitmap = (1u << EXC_MACHINE_CHECK) | (1u << EXC_NOMATH);
-
-#ifdef __x86_64__
+#ifdef HAX_ARCH_X86_64
     exit_ctls = EXIT_CONTROL_HOST_ADDR_SPACE_SIZE | EXIT_CONTROL_LOAD_EFER |
                 EXIT_CONTROL_SAVE_DEBUG_CONTROLS;
 #endif
 
-#ifdef __i386__
+#ifdef HAX_ARCH_X86_32
     if (is_compatible()) {
         exit_ctls = EXIT_CONTROL_HOST_ADDR_SPACE_SIZE | EXIT_CONTROL_LOAD_EFER |
                     EXIT_CONTROL_SAVE_DEBUG_CONTROLS;
@@ -1169,8 +1372,9 @@ static void fill_common_vmcs(struct vcpu_t *vcpu)
     entry_ctls = ENTRY_CONTROL_LOAD_DEBUG_CONTROLS;
 
     if ((vmcs_err = load_vmcs(vcpu, &flags))) {
-        hax_panic_vcpu(vcpu, "load_vmcs failed while vcpu_prepare: %x",
-                       vmcs_err);
+        vcpu_set_panic(vcpu);
+        hax_log(HAX_LOGPANIC, "load_vmcs failed while vcpu_prepare: %x",
+                vmcs_err);
         hax_panic_log(vcpu);
         return;
     }
@@ -1181,7 +1385,7 @@ static void fill_common_vmcs(struct vcpu_t *vcpu)
     vmwrite(vcpu, HOST_CR3, get_cr3());
     vmwrite(vcpu, HOST_CR4, get_cr4());
 
-#ifdef __x86_64__
+#ifdef HAX_ARCH_X86_64
     vmwrite(vcpu, HOST_CS_SELECTOR, get_kernel_cs());
 #else
     if (is_compatible()) {
@@ -1196,7 +1400,7 @@ static void fill_common_vmcs(struct vcpu_t *vcpu)
     vmwrite(vcpu, HOST_FS_SELECTOR, get_kernel_fs());
     vmwrite(vcpu, HOST_GS_SELECTOR, get_kernel_gs());
 
-#ifdef __x86_64__
+#ifdef HAX_ARCH_X86_64
     vmwrite(vcpu, HOST_FS_BASE, ia32_rdmsr(IA32_FS_BASE));
     vmwrite(vcpu, HOST_GS_BASE, ia32_rdmsr(IA32_GS_BASE));
 #else
@@ -1213,9 +1417,9 @@ static void fill_common_vmcs(struct vcpu_t *vcpu)
     vmwrite(vcpu, HOST_GDTR_BASE, get_kernel_gdtr_base());
     vmwrite(vcpu, HOST_IDTR_BASE, get_kernel_idtr_base());
 
-#define WRITE_CONTROLS(vcpu, f, v) {                                    \
-    uint32 g = v & cpu_data->vmx_info.v##_1 | cpu_data->vmx_info.v##_0; \
-    vmwrite(vcpu, f, v = g);                                            \
+#define WRITE_CONTROLS(vcpu, f, v) {                                        \
+    uint32_t g = (v & cpu_data->vmx_info.v##_1) | cpu_data->vmx_info.v##_0; \
+    vmwrite(vcpu, f, v = g);                                                \
 }
 
     WRITE_CONTROLS(vcpu, VMX_PIN_CONTROLS, pin_ctls);
@@ -1224,7 +1428,7 @@ static void fill_common_vmcs(struct vcpu_t *vcpu)
         WRITE_CONTROLS(vcpu, VMX_SECONDARY_PROCESSOR_CONTROLS, scpu_ctls);
     }
 
-    vmwrite(vcpu, VMX_EXCEPTION_BITMAP, exc_bitmap);
+    vcpu_update_exception_bitmap(vcpu);
 
     WRITE_CONTROLS(vcpu, VMX_EXIT_CONTROLS, exit_ctls);
 
@@ -1264,16 +1468,17 @@ static void fill_common_vmcs(struct vcpu_t *vcpu)
     load_vmcs_common(vcpu);
 
     if ((vmcs_err = put_vmcs(vcpu, &flags))) {
-        hax_panic_vcpu(vcpu, "put_vmcs() failed in vcpu_prepare, %x\n",
-                       vmcs_err);
+        vcpu_set_panic(vcpu);
+        hax_log(HAX_LOGPANIC, "put_vmcs() failed in vcpu_prepare, %x\n",
+                vmcs_err);
         hax_panic_log(vcpu);
     }
 }
 
 static void vcpu_prepare(struct vcpu_t *vcpu)
 {
-    hax_debug("HAX: vcpu_prepare current %x, CPU %x\n", vcpu->vcpu_id,
-              hax_cpuid());
+    hax_log(HAX_LOGD, "vcpu_prepare current %x, CPU %x\n", vcpu->vcpu_id,
+            hax_cpuid());
     hax_mutex_lock(vcpu->tmutex);
     fill_common_vmcs(vcpu);
     hax_mutex_unlock(vcpu->tmutex);
@@ -1289,7 +1494,7 @@ void vcpu_load_host_state(struct vcpu_t *vcpu)
 
     // Should be called when lock is got
     vcpu->state->_cr2 = get_cr2();
-    load_kernel_ldt(hstate->ldt_selector);
+    set_kernel_ldt(hstate->ldt_selector);
     if (hstate->seg_valid & HOST_SEG_VALID_ES) {
         set_kernel_es(hstate->es);
     }
@@ -1321,7 +1526,25 @@ void vcpu_load_host_state(struct vcpu_t *vcpu)
     load_host_msr(vcpu);
     set_cr2(hstate->hcr2);
 
+    load_host_dr(vcpu);
+
     vcpu_exit_fpu_state(vcpu);
+}
+
+void vcpu_save_guest_state(struct vcpu_t *vcpu)
+{
+    save_guest_msr(vcpu);
+
+    save_guest_dr(vcpu);
+}
+
+void vcpu_load_guest_state(struct vcpu_t *vcpu)
+{
+    load_guest_msr(vcpu);
+
+    load_guest_dr(vcpu);
+
+    load_dirty_vmcs_fields(vcpu);
 }
 
 /*
@@ -1331,20 +1554,20 @@ void vcpu_load_host_state(struct vcpu_t *vcpu)
  * |size| is the number of bytes to copy, and must be one of {1, 2, 4, 8}.
  * Returns 0 on success, -1 if |size| is invalid.
  */
-static int read_low_bits(uint64 *pdst, uint64 src, uint8 size)
+static int read_low_bits(uint64_t *pdst, uint64_t src, uint8_t size)
 {
     // Assume little-endian
     switch (size) {
         case 1: {
-            *pdst = (uint8)src;
+            *pdst = (uint8_t)src;
             break;
         }
         case 2: {
-            *pdst = (uint16)src;
+            *pdst = (uint16_t)src;
             break;
         }
         case 4: {
-            *pdst = (uint32)src;
+            *pdst = (uint32_t)src;
             break;
         }
         case 8: {
@@ -1353,7 +1576,7 @@ static int read_low_bits(uint64 *pdst, uint64 src, uint8 size)
         }
         default: {
             // Should never happen
-            hax_error("read_low_bits: Invalid size %u\n", size);
+            hax_log(HAX_LOGE, "read_low_bits: Invalid size %u\n", size);
             return -1;
         }
     }
@@ -1367,19 +1590,19 @@ static int read_low_bits(uint64 *pdst, uint64 src, uint8 size)
  * |size| is the number of bytes to copy, and must be one of {1, 2, 4, 8}.
  * Returns 0 on success, -1 if |size| is invalid.
  */
-static int write_low_bits(uint64 *pdst, uint64 src, uint8 size)
+static int write_low_bits(uint64_t *pdst, uint64_t src, uint8_t size)
 {
     switch (size) {
         case 1: {
-            *((uint8 *)pdst) = (uint8)src;
+            *((uint8_t *)pdst) = (uint8_t)src;
             break;
         }
         case 2: {
-            *((uint16 *)pdst) = (uint16)src;
+            *((uint16_t *)pdst) = (uint16_t)src;
             break;
         }
         case 4: {
-            *((uint32 *)pdst) = (uint32)src;
+            *((uint32_t *)pdst) = (uint32_t)src;
             break;
         }
         case 8: {
@@ -1388,56 +1611,11 @@ static int write_low_bits(uint64 *pdst, uint64 src, uint8 size)
         }
         default: {
             // Should never happen
-            hax_error("write_low_bits: Invalid size %u\n", size);
+            hax_log(HAX_LOGE, "write_low_bits: Invalid size %u\n", size);
             return -1;
         }
     }
     return 0;
-}
-
-static void handle_mmio_post(struct vcpu_t *vcpu, struct hax_fastmmio *hft)
-{
-    struct vcpu_state_t *state = vcpu->state;
-
-    if (hft->direction)
-        return;
-
-    if (vcpu->post_mmio.op == VCPU_POST_MMIO_WRITE_REG) {
-        uint64 value;
-        // No special treatment for MOVZX, because the source value is
-        // automatically zero-extended to 64 bits
-        read_low_bits(&value, hft->value, hft->size);
-        switch (vcpu->post_mmio.manip) {
-            case VCPU_POST_MMIO_MANIP_AND: {
-                value &= vcpu->post_mmio.value;
-                break;
-            }
-            case VCPU_POST_MMIO_MANIP_OR: {
-                value |= vcpu->post_mmio.value;
-                break;
-            }
-            case VCPU_POST_MMIO_MANIP_XOR: {
-                value ^= vcpu->post_mmio.value;
-                break;
-            }
-            default: {
-                break;
-            }
-        }
-        // Avoid overwriting high bits of the register if hft->size < 8
-        write_low_bits(&state->_regs[vcpu->post_mmio.reg_index], value,
-                       hft->size);
-    } else if (vcpu->post_mmio.op == VCPU_POST_MMIO_WRITE_MEM) {
-        // Assume little-endian
-        if (!vcpu_write_guest_virtual(vcpu, vcpu->post_mmio.va, hft->size,
-                                      (uint8 *)&hft->value, hft->size, 0)) {
-            hax_panic_vcpu(vcpu, "Error writing %u bytes to guest RAM "
-                           "(va=0x%llx, value=0x%llx)\n", hft->size,
-                           vcpu->post_mmio.va, hft->value);
-        }
-    } else {
-        hax_warning("Unknown post-MMIO operation %d\n", vcpu->post_mmio.op);
-    }
 }
 
 static void handle_io_post(struct vcpu_t *vcpu, struct hax_tunnel *htun)
@@ -1452,21 +1630,22 @@ static void handle_io_post(struct vcpu_t *vcpu, struct hax_tunnel *htun)
         size = htun->io._count * htun->io._size;
         if (!vcpu_write_guest_virtual(vcpu, htun->io._vaddr, IOS_MAX_BUFFER,
                                       (void *)vcpu->io_buf, size, 0)) {
-            hax_panic_vcpu(vcpu, "Unexpected page fault, kill the VM!\n");
+            vcpu_set_panic(vcpu);
+            hax_log(HAX_LOGPANIC, "Unexpected page fault, kill the VM!\n");
             dump_vmcs(vcpu);
         }
     } else {
         switch (htun->io._size) {
             case 1: {
-                state->_al = *((uint8 *)vcpu->io_buf);
+                state->_al = *((uint8_t *)vcpu->io_buf);
                 break;
             }
             case 2: {
-                state->_ax = *((uint16 *)vcpu->io_buf);
+                state->_ax = *((uint16_t *)vcpu->io_buf);
                 break;
             }
             case 4: {
-                state->_eax = *((uint32 *)vcpu->io_buf);
+                state->_eax = *((uint32_t *)vcpu->io_buf);
                 break;
             }
             default: {
@@ -1479,24 +1658,38 @@ static void handle_io_post(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 int vcpu_execute(struct vcpu_t *vcpu)
 {
     struct hax_tunnel *htun = vcpu->tunnel;
+    struct em_context_t *em_ctxt = &vcpu->emulate_ctxt;
+    em_status_t rc;
     int err = 0;
 
     hax_mutex_lock(vcpu->tmutex);
-    hax_debug("vcpu begin to run....\n");
+    hax_log(HAX_LOGD, "vcpu begin to run....\n");
     // QEMU will do realmode stuff for us
     if (!hax->ug_enable_flag && !(vcpu->state->_cr0 & CR0_PE)) {
         htun->_exit_reason = 0;
         htun->_exit_status = HAX_EXIT_REALMODE;
-        hax_debug("Guest is in realmode.\n");
+        hax_log(HAX_LOGD, "Guest is in realmode.\n");
         goto out;
     }
-    hax_debug("vcpu begin to run....in PE\n");
+    hax_log(HAX_LOGD, "vcpu begin to run....in PE\n");
 
     if (htun->_exit_status == HAX_EXIT_IO) {
         handle_io_post(vcpu, htun);
     }
-    if (htun->_exit_status == HAX_EXIT_FAST_MMIO) {
-        handle_mmio_post(vcpu, (struct hax_fastmmio *)vcpu->io_buf);
+    // Continue until emulation finishes
+    if (!em_ctxt->finished) {
+        rc = em_emulate_insn(em_ctxt);
+        if (rc < 0) {
+            vcpu_set_panic(vcpu);
+            hax_log(HAX_LOGPANIC, "%s: em_emulate_insn() failed: vcpu_id=%u\n",
+                    __func__, vcpu->vcpu_id);
+            err = HAX_RESUME;
+            goto out;
+        }
+        if (rc > 0) {
+            err = HAX_EXIT;
+            goto out;
+        }
     }
     err = cpu_vmx_execute(vcpu, htun);
     vcpu_is_panic(vcpu);
@@ -1506,6 +1699,7 @@ out:
         vcpu_vmread_all(vcpu);
         vcpu_is_panic(vcpu);
     }
+    htun->apic_base = vcpu->gstate.apic_base;
     hax_mutex_unlock(vcpu->tmutex);
 
     return err;
@@ -1536,7 +1730,7 @@ int vtlb_active(struct vcpu_t *vcpu)
     if (hax->ug_enable_flag)
         return 0;
 
-    hax_debug("vtlb active: cr0, %llx\n", state->_cr0);
+    hax_log(HAX_LOGD, "vtlb active: cr0, %llx\n", state->_cr0);
     if ((state->_cr0 & CR0_PG) == 0)
         return 1;
 
@@ -1552,61 +1746,22 @@ int vtlb_active(struct vcpu_t *vcpu)
 static void advance_rip(struct vcpu_t *vcpu)
 {
     struct vcpu_state_t *state = vcpu->state;
-    preempt_flag flags;
-    uint32 interruptibility = vmread(vcpu, GUEST_INTERRUPTIBILITY);
-    uint32 vmcs_err = 0;
-    if ((vmcs_err = load_vmcs(vcpu, &flags))) {
-        hax_panic_vcpu(vcpu, "load_vmcs while advance_rip: %x", vmcs_err);
-        hax_panic_log(vcpu);
-        return;
-    }
+    uint32_t interruptibility = vmx(vcpu, interruptibility_state).raw;
 
     if (interruptibility & 3u) {
         interruptibility &= ~3u;
-        vmwrite(vcpu, GUEST_INTERRUPTIBILITY, interruptibility);
-    }
-    state->_rip += vmread(vcpu, VM_EXIT_INFO_INSTRUCTION_LENGTH);
-    vmwrite(vcpu, GUEST_RIP, state->_rip);
-
-    if ((vmcs_err = put_vmcs(vcpu, &flags))) {
-        hax_panic_vcpu(vcpu, "put_vmcs while advance_rip: %x\n", vmcs_err);
-        hax_panic_log(vcpu);
-    }
-}
-
-static void advance_rip_step(struct vcpu_t *vcpu, int step)
-{
-    struct vcpu_state_t *state = vcpu->state;
-    preempt_flag flags;
-    uint32 interruptibility = vmread(vcpu, GUEST_INTERRUPTIBILITY);
-    uint32 vmcs_err = 0;
-    if ((vmcs_err = load_vmcs(vcpu, &flags))) {
-        hax_panic_vcpu(vcpu, "load_vmcs while advance_rip_step: %x\n",
-                       vmcs_err);
-        hax_panic_log(vcpu);
-        return;
+        vmx(vcpu, interruptibility_state).raw = interruptibility;
+        vcpu->interruptibility_dirty = 1;
     }
 
-    if (interruptibility & 3u) {
-        interruptibility &= ~3u;
-        vmwrite(vcpu, GUEST_INTERRUPTIBILITY, interruptibility);
-    }
-    if (step) {
-        state->_rip += step;
-        vmwrite(vcpu, GUEST_RIP, state->_rip);
-    }
-
-    if ((vmcs_err = put_vmcs(vcpu, &flags))) {
-        hax_panic_vcpu(vcpu, "put_vmcs() while advance_rip_step: %x\n",
-                       vmcs_err);
-        hax_panic_log(vcpu);
-    }
+    state->_rip += vmx(vcpu, exit_instr_length);
+    vcpu->rip_dirty = 1;
 }
 
 void vcpu_vmread_all(struct vcpu_t *vcpu)
 {
     struct vcpu_state_t *state = vcpu->state;
-    uint32 vmcs_err = 0;
+    uint32_t vmcs_err = 0;
 
     if (vcpu->cur_state == GS_STALE) {
         preempt_flag flags;
@@ -1614,20 +1769,26 @@ void vcpu_vmread_all(struct vcpu_t *vcpu)
         // CRs were already updated
         // TODO: Always read RIP, RFLAGs, maybe reduce them in future!
         if ((vmcs_err = load_vmcs(vcpu, &flags))) {
-            hax_panic_vcpu(vcpu, "load_vmcs failed while vcpu_vmread_all: %x\n",
-                           vmcs_err);
+            vcpu_set_panic(vcpu);
+            hax_log(HAX_LOGPANIC, "load_vmcs failed while "
+                    "vcpu_vmread_all: %x\n", vmcs_err);
             hax_panic_log(vcpu);
             return;
         }
 
-        state->_rip = vmread(vcpu, GUEST_RIP);
-        state->_rflags = vmread(vcpu, GUEST_RFLAGS);
+        if (!vcpu->rip_dirty)
+            state->_rip = vmread(vcpu, GUEST_RIP);
+
+        if (!vcpu->rflags_dirty)
+            state->_rflags = vmread(vcpu, GUEST_RFLAGS);
+
         state->_rsp = vmread(vcpu, GUEST_RSP);
 
         VMREAD_SEG(vcpu, CS, state->_cs);
         VMREAD_SEG(vcpu, DS, state->_ds);
         VMREAD_SEG(vcpu, ES, state->_es);
-        VMREAD_SEG(vcpu, FS, state->_fs);
+        if (!vcpu->fs_base_dirty)
+            VMREAD_SEG(vcpu, FS, state->_fs);
         VMREAD_SEG(vcpu, GS, state->_gs);
         VMREAD_SEG(vcpu, SS, state->_ss);
         VMREAD_SEG(vcpu, LDTR, state->_ldt);
@@ -1637,8 +1798,9 @@ void vcpu_vmread_all(struct vcpu_t *vcpu)
         vmx(vcpu, interruptibility_state).raw = vmread(
                 vcpu, GUEST_INTERRUPTIBILITY);
         if ((vmcs_err = put_vmcs(vcpu, &flags))) {
-            hax_panic_vcpu(vcpu, "put_vmcs failed while vcpu_vmread_all: %x\n",
-                           vmcs_err);
+            vcpu_set_panic(vcpu);
+            hax_log(HAX_LOGPANIC, "put_vmcs failed while vcpu_vmread_all: %x\n",
+                    vmcs_err);
             hax_panic_log(vcpu);
         }
 
@@ -1651,13 +1813,16 @@ void vcpu_vmwrite_all(struct vcpu_t *vcpu, int force_tlb_flush)
     struct vcpu_state_t *state = vcpu->state;
 
     vmwrite(vcpu, GUEST_RIP, state->_rip);
+    vcpu->rip_dirty = 0;
     vmwrite(vcpu, GUEST_RFLAGS, state->_rflags);
+    vcpu->rflags_dirty = 0;
     vmwrite(vcpu, GUEST_RSP, state->_rsp);
 
     VMWRITE_SEG(vcpu, CS, state->_cs);
     VMWRITE_SEG(vcpu, DS, state->_ds);
     VMWRITE_SEG(vcpu, ES, state->_es);
     VMWRITE_SEG(vcpu, FS, state->_fs);
+    vcpu->fs_base_dirty = 0;
     VMWRITE_SEG(vcpu, GS, state->_gs);
     VMWRITE_SEG(vcpu, SS, state->_ss);
     VMWRITE_SEG(vcpu, LDTR, state->_ldt);
@@ -1682,12 +1847,12 @@ void vcpu_vmwrite_all(struct vcpu_t *vcpu, int force_tlb_flush)
 // Returns 0 on success, < 0 on error.
 static int vcpu_prepare_pae_pdpt(struct vcpu_t *vcpu)
 {
-    uint64 cr3 = vcpu->state->_cr3;
+    uint64_t cr3 = vcpu->state->_cr3;
     int pdpt_size = (int)sizeof(vcpu->pae_pdptes);
 #ifdef CONFIG_HAX_EPT2
     // CR3 is the GPA of the page-directory-pointer table. According to IASDM
     // Vol. 3A 4.4.1, Table 4-7, bits 63..32 and 4..0 of this GPA are ignored.
-    uint64 gpa = cr3 & 0xffffffe0;
+    uint64_t gpa = cr3 & 0xffffffe0;
     int ret;
 
     // On Mac, the following call may somehow cause the XNU kernel to preempt
@@ -1696,34 +1861,36 @@ static int vcpu_prepare_pae_pdpt(struct vcpu_t *vcpu)
     // simply disabling IRQs). Therefore, it is not safe to call this function
     // with preemption disabled.
     ret = gpa_space_read_data(&vcpu->vm->gpa_space, gpa, pdpt_size,
-                              (uint8 *)vcpu->pae_pdptes);
+                              (uint8_t *)vcpu->pae_pdptes);
     // The PAE PDPT cannot span two page frames
     if (ret != pdpt_size) {
-        hax_error("%s: Failed to read PAE PDPT: cr3=0x%llx, ret=%d\n", __func__,
-                  cr3, ret);
+        hax_log(HAX_LOGE, "%s: Failed to read PAE PDPT: cr3=0x%llx, ret=%d\n",
+                __func__, cr3, ret);
         return ret < 0 ? ret : -EIO;
     }
+    vcpu->pae_pdpt_dirty = 1;
     return 0;
 #else // !CONFIG_HAX_EPT2
-    uint64 gpfn = (cr3 & 0xfffff000) >> PG_ORDER_4K;
-    uint8 *buf, *pdpt;
-#if (defined(__MACH__) || defined(_WIN64))
+    uint64_t gpfn = (cr3 & 0xfffff000) >> PG_ORDER_4K;
+    uint8_t *buf, *pdpt;
+#ifdef HAX_ARCH_X86_64
     buf = hax_map_gpfn(vcpu->vm, gpfn);
-#else  // !defined(__MACH__) && !defined(_WIN64), i.e. Win32
+#else  // !HAX_ARCH_X86_64, i.e. HAX_ARCH_X86_32
     buf = hax_map_gpfn(vcpu->vm, gpfn, false, cr3 & 0xfffff000, 1);
-#endif  // defined(__MACH__) || defined(_WIN64)
+#endif  // HAX_ARCH_X86_64
     if (!buf) {
-        hax_error("%s: Failed to map guest page frame containing PAE PDPT:"
-                  " cr3=0x%llx\n",  __func__, cr3);
+        hax_log(HAX_LOGE, "%s: Failed to map guest page frame containing PAE "
+                "PDPT: cr3=0x%llx\n",  __func__, cr3);
         return -ENOMEM;
     }
     pdpt = buf + (cr3 & 0xfe0);
     memcpy_s(vcpu->pae_pdptes, pdpt_size, pdpt, pdpt_size);
-#if (defined(__MACH__) || defined(_WIN64))
+#ifdef HAX_ARCH_X86_64
     hax_unmap_gpfn(buf);
-#else  // !defined(__MACH__) && !defined(_WIN64), i.e. Win32
+#else  // !HAX_ARCH_X86_64, i.e. HAX_ARCH_X86_32
     hax_unmap_gpfn(vcpu->vm, buf, gpfn);
-#endif  // defined(__MACH__) || defined(_WIN64)
+#endif  // HAX_ARCH_X86_64
+    vcpu->pae_pdpt_dirty = 1;
     return 0;
 #endif  // CONFIG_HAX_EPT2
 }
@@ -1733,36 +1900,36 @@ static void vmwrite_cr(struct vcpu_t *vcpu)
     struct vcpu_state_t *state = vcpu->state;
     struct per_cpu_data *cpu = current_cpu_data();
 
-    uint32 entry_ctls = vmx(vcpu, entry_ctls_base);
-    uint32 pcpu_ctls = vmx(vcpu, pcpu_ctls_base);
-    uint32 scpu_ctls = vmx(vcpu, scpu_ctls_base);
-    uint32 exc_bitmap = vmx(vcpu, exc_bitmap_base);
-    uint64 eptp;
+    uint32_t entry_ctls = vmx(vcpu, entry_ctls_base);
+    uint32_t pcpu_ctls = vmx(vcpu, pcpu_ctls_base);
+    uint32_t scpu_ctls = vmx(vcpu, scpu_ctls_base);
+    uint32_t exc_bitmap = vmx(vcpu, exc_bitmap_base);
+    uint64_t eptp;
 
     // If a bit is set here, the same bit of guest CR0 must be fixed to 1 (see
     // IASDM Vol. 3D A.7)
-    uint64 cr0_fixed_0 = cpu->vmx_info._cr0_fixed_0;
+    uint64_t cr0_fixed_0 = cpu->vmx_info._cr0_fixed_0;
     // If a bit is clear here, the same bit of guest CR0 must be fixed to 0 (see
     // IASDM Vol. 3D A.7)
-    uint64 cr0_fixed_1 = cpu->vmx_info._cr0_fixed_1;
+    uint64_t cr0_fixed_1 = cpu->vmx_info._cr0_fixed_1;
 
-    uint64 cr0 = (state->_cr0 & cr0_fixed_1) |
-                 (cr0_fixed_0 & (uint64)~(CR0_PE | CR0_PG));
+    uint64_t cr0 = (state->_cr0 & cr0_fixed_1) |
+                 (cr0_fixed_0 & (uint64_t)~(CR0_PE | CR0_PG));
 
-    uint64 cr0_mask;
-    uint64 cr0_shadow;
+    uint64_t cr0_mask;
+    uint64_t cr0_shadow;
 
     // If a bit is set here, the same bit of guest CR4 must be fixed to 1 (see
     // IASDM Vol. 3D A.8)
-    uint64 cr4_fixed_0 = cpu->vmx_info._cr4_fixed_0;
+    uint64_t cr4_fixed_0 = cpu->vmx_info._cr4_fixed_0;
     // If a bit is clear here, the same bit of guest CR4 must be fixed to 0 (see
     // IASDM Vol. 3D A.8)
-    uint64 cr4_fixed_1 = cpu->vmx_info._cr4_fixed_1;
+    uint64_t cr4_fixed_1 = cpu->vmx_info._cr4_fixed_1;
 
-    uint64 cr4 = ((state->_cr4 | CR4_MCE) & cr4_fixed_1) | cr4_fixed_0;
-    uint64 cr4_mask = vmx(vcpu, cr4_mask) | ~(cr4_fixed_0 ^ cr4_fixed_1) |
+    uint64_t cr4 = ((state->_cr4 | CR4_MCE) & cr4_fixed_1) | cr4_fixed_0;
+    uint64_t cr4_mask = vmx(vcpu, cr4_mask) | ~(cr4_fixed_0 ^ cr4_fixed_1) |
                       CR4_VMXE | CR4_SMXE | CR4_MCE;
-    uint64 cr4_shadow;
+    uint64_t cr4_shadow;
 
     if (hax->ug_enable_flag) {
         // In UG mode, we can allow the guest to freely modify CR0.PE without
@@ -1780,9 +1947,9 @@ static void vmwrite_cr(struct vcpu_t *vcpu)
     }
 
     if (vtlb_active(vcpu)) {
-        hax_debug("vTLB mode, cr0 %llx\n", vcpu->state->_cr0);
+        hax_log(HAX_LOGD, "vTLB mode, cr0 %llx\n", vcpu->state->_cr0);
         vcpu->mmu->mmu_mode = MMU_MODE_VTLB;
-        exc_bitmap |= 1u << EXC_PAGEFAULT;
+        exc_bitmap |= 1u << VECTOR_PF;
         cr0 |= CR0_WP;
         cr0_mask |= CR0_WP;
         cr4 |= CR4_PGE | CR4_PAE;
@@ -1805,21 +1972,26 @@ static void vmwrite_cr(struct vcpu_t *vcpu)
         // Vol. 3A 4.4.1)
         cr4_mask |= CR4_PAE;
         eptp = vm_get_eptp(vcpu->vm);
-        ASSERT(eptp != INVALID_EPTP);
-        // hax_debug("Guest eip:%llx, EPT mode, eptp:%llx\n", vcpu->state->_rip,
-        //           eptp);
+        hax_assert(eptp != INVALID_EPTP);
+        // hax_log(HAX_LOGD, "Guest eip:%llx, EPT mode, eptp:%llx\n",
+        //         vcpu->state->_rip, eptp);
         vmwrite(vcpu, GUEST_CR3, state->_cr3);
         scpu_ctls |= ENABLE_EPT;
-        // Set PDPTEs for vCPU if it's in or about to enter PAE paging mode
-        if ((state->_cr4 & CR4_PAE) && !(state->_efer & IA32_EFER_LME) &&
-            (state->_cr0 & CR0_PG)) {
-            // vcpu_prepare_pae_pdpt() has populated vcpu->pae_pdptes
-            // TODO: Enable CR3_LOAD_EXITING so as to update vcpu->pae_pdptes
-            // whenever guest writes to CR3 in EPT+PAE mode
+        if (vcpu->pae_pdpt_dirty) {
+            // vcpu_prepare_pae_pdpt() has updated vcpu->pae_pdptes
+            // Note that because we do not monitor guest writes to CR3, the only
+            // case where vcpu->pae_pdptes is newer than VMCS GUEST_PDPTE{0..3}
+            // is following a guest write to CR0 or CR4 that requires PDPTEs to
+            // be reloaded, i.e. the pae_pdpt_dirty case. When the guest is in
+            // PAE paging mode but !pae_pdpt_dirty, VMCS GUEST_PDPTE{0..3} are
+            // already up-to-date following each VM exit (see Intel SDM Vol. 3C
+            // 27.3.4), and we must not overwrite them with our cached values
+            // (vcpu->pae_pdptes), which may be outdated.
             vmwrite(vcpu, GUEST_PDPTE0, vcpu->pae_pdptes[0]);
             vmwrite(vcpu, GUEST_PDPTE1, vcpu->pae_pdptes[1]);
             vmwrite(vcpu, GUEST_PDPTE2, vcpu->pae_pdptes[2]);
             vmwrite(vcpu, GUEST_PDPTE3, vcpu->pae_pdptes[3]);
+            vcpu->pae_pdpt_dirty = 0;
         }
         vmwrite(vcpu, VMX_EPTP, eptp);
         // pcpu_ctls |= RDTSC_EXITING;
@@ -1827,7 +1999,7 @@ static void vmwrite_cr(struct vcpu_t *vcpu)
 
     vmwrite(vcpu, GUEST_CR0, cr0);
     vmwrite(vcpu, VMX_CR0_MASK, cr0_mask);
-    hax_debug("vmwrite_cr cr0 %llx, cr0_mask %llx\n", cr0, cr0_mask);
+    hax_log(HAX_LOGD, "vmwrite_cr cr0 %llx, cr0_mask %llx\n", cr0, cr0_mask);
     cr0_shadow = (state->_cr0 & ~vmx(vcpu, cr0_mask)) |
                  (vmx(vcpu, cr0_shadow) & vmx(vcpu, cr0_mask));
     vmwrite(vcpu, VMX_CR0_READ_SHADOW, cr0_shadow);
@@ -1856,8 +2028,8 @@ static void vmwrite_cr(struct vcpu_t *vcpu)
         entry_ctls |= ENTRY_CONTROL_LONG_MODE_GUEST;
     }
     if (pcpu_ctls != vmx(vcpu, pcpu_ctls)) {
-        vmwrite(vcpu, VMX_PRIMARY_PROCESSOR_CONTROLS,
-                vmx(vcpu, pcpu_ctls) = pcpu_ctls);
+        vmx(vcpu, pcpu_ctls) = pcpu_ctls;
+        vcpu->pcpu_ctls_dirty = 1;
     }
     if (scpu_ctls != vmx(vcpu, scpu_ctls)) {
         vmwrite(vcpu, VMX_SECONDARY_PROCESSOR_CONTROLS,
@@ -1878,10 +2050,15 @@ static void vcpu_enter_fpu_state(struct vcpu_t *vcpu)
     struct fx_layout *hfx = (struct fx_layout *)hax_page_va(hstate->hfxpage);
     struct fx_layout *gfx = (struct fx_layout *)hax_page_va(gstate->gfxpage);
 
-    if (vcpu->is_fpu_used) {
-        fxsave((mword *)hfx);
-        fxrstor((mword *)gfx);
-    }
+    hstate->cr0_ts = !!(get_cr0() & CR0_TS);
+
+    // Before executing any FPU instruction (e.g. FXSAVE) in host kernel
+    // context, make sure host CR0.TS = 0, so as to prevent a Device Not Found
+    // (#NM) exception, which can result in a host kernel panic on NetBSD.
+    hax_clts();
+
+    hax_fxsave((mword *)hfx);
+    hax_fxrstor((mword *)gfx);
 }
 
 static void vcpu_exit_fpu_state(struct vcpu_t *vcpu)
@@ -1891,81 +2068,16 @@ static void vcpu_exit_fpu_state(struct vcpu_t *vcpu)
     struct fx_layout *hfx = (struct fx_layout *)hax_page_va(hstate->hfxpage);
     struct fx_layout *gfx = (struct fx_layout *)hax_page_va(gstate->gfxpage);
 
-    if (vcpu->is_fpu_used) {
-        fxsave((mword *)gfx);
-        fxrstor((mword *)hfx);
+    hax_clts();
+
+    hax_fxsave((mword *)gfx);
+    hax_fxrstor((mword *)hfx);
+
+    if (hstate->cr0_ts) {
+        set_cr0(get_cr0() | CR0_TS);
     }
 }
 
-struct decode {
-    paddr_t gpa;
-    paddr_t value;
-    uint8_t size;       // Operand/value size in bytes (1, 2, 4 or 8)
-    uint8_t addr_size;  // Address size in bytes (2, 4 or 8)
-    uint8_t opcode_dir;
-    uint8_t reg_index;
-    vaddr_t va;         // Non-I/O GVA operand (e.g. in MOVS instructions)
-    paddr_t src_pa;
-    paddr_t dst_pa;
-    uint8_t advance;
-    bool    has_rep;    // Whether the instruction is prefixed with REP
-};
-
-// ModR/M byte (see IA SDM Vol. 2A 2.1 Figure 2-1)
-union modrm_byte {
-    uint8_t value;
-    struct {
-        uint8_t rm  : 3;
-        uint8_t reg : 3;
-        uint8_t mod : 2;
-    };
-} PACKED;
-
-// SIB byte (see IA SDM Vol. 2A 2.1 Figure 2-1)
-union sib_byte {
-    uint8_t value;
-    struct {
-        uint8_t base  : 3;
-        uint8_t index : 3;
-        uint8_t scale : 2;
-    };
-} PACKED;
-
-// Data transfer operations
-#define OPCODE_MOV_IOMEM_TO_REG     0
-#define OPCODE_MOV_REG_TO_IOMEM     1
-#define OPCODE_MOV_NUM_TO_IOMEM     3
-#define OPCODE_STOS                 4
-#define OPCODE_MOVS_MEM_TO_IOMEM    5
-#define OPCODE_MOVS_IOMEM_TO_MEM    6
-#define OPCODE_MOVS_IOMEM_TO_IOMEM  7
-#define OPCODE_MOVZX_IOMEM_TO_REG   8
-
-// Bitwise operations
-#define OPCODE_AND_NUM_TO_IOMEM     20  // not supported yet
-#define OPCODE_AND_REG_TO_IOMEM     21  // not supported yet
-#define OPCODE_AND_IOMEM_TO_REG     22
-#define OPCODE_OR_NUM_TO_IOMEM      23  // not supported yet
-#define OPCODE_OR_REG_TO_IOMEM      24  // not supported yet
-#define OPCODE_OR_IOMEM_TO_REG      25
-#define OPCODE_XOR_NUM_TO_IOMEM     26  // not supported yet
-#define OPCODE_XOR_REG_TO_IOMEM     27  // not supported yet
-#define OPCODE_XOR_IOMEM_TO_REG     28
-#define OPCODE_NOT_IOMEM            29  // not supported yet
-
-#define PF_SEG_OVERRIDE_NONE        0
-// Each of the following denotes the presence of a segment override prefix
-//   http://wiki.osdev.org/X86-64_Instruction_Encoding
-#define PF_SEG_OVERRIDE_CS          1  // 0x2e
-#define PF_SEG_OVERRIDE_SS          2  // 0x36
-#define PF_SEG_OVERRIDE_DS          3  // 0x3e
-#define PF_SEG_OVERRIDE_ES          4  // 0x26
-#define PF_SEG_OVERRIDE_FS          5  // 0x64
-#define PF_SEG_OVERRIDE_GS          6  // 0x65
-
-// An instruction can have up to 4 legacy prefixes:
-//   http://wiki.osdev.org/X86-64_Instruction_Encoding
-#define INSTR_MAX_LEGACY_PF         4
 // Instructions are never longer than 15 bytes:
 //   http://wiki.osdev.org/X86-64_Instruction_Encoding
 #define INSTR_MAX_LEN               15
@@ -1984,11 +2096,11 @@ static bool qemu_support_fastmmio_extra(struct vcpu_t *vcpu)
     return vm->features & VM_FEATURES_FASTMMIO_EXTRA;
 }
 
-static bool is_mmio_address(struct vcpu_t *vcpu, paddr_t gpa)
+static bool is_mmio_address(struct vcpu_t *vcpu, hax_paddr_t gpa)
 {
-    paddr_t hpa;
+    hax_paddr_t hpa;
     if (vtlb_active(vcpu)) {
-        hpa = hax_gpfn_to_hpa(vcpu->vm, gpa >> page_shift);
+        hpa = hax_gpfn_to_hpa(vcpu->vm, gpa >> HAX_PAGE_SHIFT);
         // hax_gpfn_to_hpa() assumes hpa == 0 is invalid
         return !hpa;
     } else {
@@ -2002,682 +2114,297 @@ static bool is_mmio_address(struct vcpu_t *vcpu, paddr_t gpa)
     }
 }
 
-// Returns 0 on success, < 0 on error, > 0 if HAX_EXIT_MMIO is necessary.
-static int vcpu_simple_decode(struct vcpu_t *vcpu, struct decode *dc)
+static int vcpu_emulate_insn(struct vcpu_t *vcpu)
 {
-    uint64 cs_base = vcpu->state->_cs.base;
-    uint64 rip = vcpu->state->_rip;
-    vaddr_t va;
-    uint8 instr[INSTR_MAX_LEN] = {0};
-    uint8 len = 0;
-    bool has_modrm;          // Whether ModR/M byte is present
-    union modrm_byte modrm;  // ModR/M byte
-    bool has_sib;            // Whether SIB byte is present
-    union sib_byte sib;      // SIB byte
-    uint8 disp_size;         // Displacement size in bytes
-    uint8 imm_size;          // Immediate size in bytes
-    int num;
-    int rex_w = 0;
-    int rex_r = 0;
-    bool is_64bit_mode;
-    int default_16bit;  // Whether operand/address sizes default to 16-bit
-    int override_operand_size = 0;
-    int override_address_size = 0;
-    int override_segment = PF_SEG_OVERRIDE_NONE;
-    int use_16bit_operands;
-    uint8 operand_size;
-    bool has_esc = false;  // Whether opcode begins with 0f (escape opcode byte)
+    em_status_t rc;
+    em_mode_t mode;
+    em_context_t *em_ctxt = &vcpu->emulate_ctxt;
+    uint8_t instr[INSTR_MAX_LEN] = {0};
+    uint64_t cs_base = vcpu->state->_cs.base;
+    uint64_t rip = vcpu->state->_rip;
+    uint64_t va;
 
-    if (!qemu_support_fastmmio(vcpu)) {
-        hax_warning("vcpu_simple_decode: QEMU does not support fast MMIO!\n");
-        return 1;
-    }
+    // Clean up the emulation context of the previous MMIO instruction, so that
+    // even if things go wrong, the behavior will still be predictable.
+    vcpu_init_emulator(vcpu);
 
-    // TODO: Is this the correct way to check if we are in 64-bit mode?
-    is_64bit_mode = vcpu->state->_cs.long_mode != 0;
+    // Detect guest mode
+    if (!(vcpu->state->_cr0 & CR0_PE))
+        mode = EM_MODE_REAL;
+    else if (vcpu->state->_cs.long_mode == 1)
+        mode = EM_MODE_PROT64;
+    else if (vcpu->state->_cs.operand_size == 1)
+        mode = EM_MODE_PROT32;
+    else
+        mode = EM_MODE_PROT16;
+    em_ctxt->mode = mode;
 
     // Fetch the instruction at guest CS:IP = CS.Base + IP, omitting segment
     // limit and privilege checks
-    va = is_64bit_mode ? rip : cs_base + rip;
+    va = (mode == EM_MODE_PROT64) ? rip : cs_base + rip;
 #ifdef CONFIG_HAX_EPT2
     if (mmio_fetch_instruction(vcpu, va, instr, INSTR_MAX_LEN)) {
-        hax_panic_vcpu(vcpu, "%s: mmio_fetch_instruction() failed: vcpu_id=%u,"
-                       " gva=0x%llx (CS:IP=0x%llx:0x%llx), mmio_gpa=0x%llx\n",
-                       __func__, vcpu->vcpu_id, va, cs_base, rip, dc->gpa);
+        vcpu_set_panic(vcpu);
+        hax_log(HAX_LOGPANIC, "%s: mmio_fetch_instruction() failed: vcpu_id=%u,"
+                " gva=0x%llx (CS:IP=0x%llx:0x%llx)\n",
+                __func__, vcpu->vcpu_id, va, cs_base, rip);
         dump_vmcs(vcpu);
         return -1;
     }
 #else  // !CONFIG_HAX_EPT2
     if (!vcpu_read_guest_virtual(vcpu, va, &instr, INSTR_MAX_LEN, INSTR_MAX_LEN,
                                  0)) {
-        hax_panic_vcpu(vcpu, "Error reading instruction at 0x%llx for decoding"
-                       " (CS:IP=0x%llx:0x%llx)\n", va, cs_base, rip);
+        vcpu_set_panic(vcpu);
+        hax_log(HAX_LOGPANIC, "Error reading instruction at 0x%llx for decoding"
+                " (CS:IP=0x%llx:0x%llx)\n", va, cs_base, rip);
         dump_vmcs(vcpu);
         return -1;
     }
 #endif  // CONFIG_HAX_EPT2
 
-    // See http://wiki.osdev.org/X86-64_Instruction_Encoding
-    default_16bit = !is_64bit_mode && ((vcpu->state->_cr0 & CR0_PE) == 0 ||
-                    vcpu->state->_cs.operand_size == 0);
-
-    // Parse legacy prefixes
-    dc->has_rep = false;
-    for (num = 0; num < INSTR_MAX_LEGACY_PF; num++) {
-        switch (instr[num]) {
-            case 0xf0: {
-                // LOCK prefix
-                // Ignored (is it possible to emulate atomic operations?)
-                break;
-            }
-            case 0xf3: {
-                // REP prefix
-                dc->has_rep = true;
-                break;
-            }
-            case 0x66: {
-                // Operand-size override prefix
-                override_operand_size = 1;
-                break;
-            }
-            case 0x67: {
-                // Address-size override prefix
-                override_address_size = 1;
-                break;
-            }
-            case 0x2e: {
-                // CS segment override prefix
-                override_segment = PF_SEG_OVERRIDE_CS;
-                break;
-            }
-            case 0x36: {
-                // SS segment override prefix
-                override_segment = PF_SEG_OVERRIDE_SS;
-                break;
-            }
-            case 0x3e: {
-                // DS segment override prefix
-                override_segment = PF_SEG_OVERRIDE_DS;
-                break;
-            }
-            case 0x26: {
-                // ES segment override prefix
-                override_segment = PF_SEG_OVERRIDE_ES;
-                break;
-            }
-            case 0x64: {
-                // FS segment override prefix
-                override_segment = PF_SEG_OVERRIDE_FS;
-                break;
-            }
-            case 0x65: {
-                // GS segment override prefix
-                override_segment = PF_SEG_OVERRIDE_GS;
-                break;
-            }
-            default: {
-                goto done_legacy_pf;
-            }
-        }
+    em_ctxt->rip = rip;
+    rc = em_decode_insn(em_ctxt, instr);
+    if (rc < 0) {
+        vcpu_set_panic(vcpu);
+        hax_log(HAX_LOGPANIC, "em_decode_insn() failed: vcpu_id=%u,"
+                " len=%u, CS:IP=0x%llx:0x%llx, instr[0..5]="
+                "0x%x 0x%x 0x%x 0x%x 0x%x 0x%x\n", vcpu->vcpu_id,
+                vcpu->vmx.exit_instr_length, cs_base, rip, instr[0],
+                instr[1], instr[2], instr[3], instr[4], instr[5]);
+        dump_vmcs(vcpu);
+        return HAX_RESUME;
     }
-
-done_legacy_pf:
-    // (1) For 32-bit code, 0x40 ~ 0x4f are inc/dec to one of general purpose
-    //     registers.  This does not apply.
-    // (2) For 64-bit code, 0x40 ~ 0x4f are size/reg (REX) prefix.
-
-    if (instr[num] >= 0x40 && instr[num] <= 0x4f) {
-        rex_w = (instr[num] & 0x08) != 0;
-        rex_r = (instr[num] & 0x04) != 0;
-        num++;
+    if (em_ctxt->len != vcpu->vmx.exit_instr_length) {
+        hax_log(HAX_LOGD, "Inferred instruction length %u does not match "
+                "VM-exit instruction length %u (CS:IP=0x%llx:0x%llx, "
+                "instr[0..5]=0x%x 0x%x 0x%x 0x%x 0x%x 0x%x)\n", em_ctxt->len,
+                vcpu->vmx.exit_instr_length, cs_base, rip, instr[0], instr[1],
+                instr[2], instr[3], instr[4], instr[5]);
     }
-
-    // See http://wiki.osdev.org/X86-64_Instruction_Encoding
-    use_16bit_operands = default_16bit ^ override_operand_size;
-    operand_size = rex_w ? 8 : (use_16bit_operands ? 2 : 4);
-    if (is_64bit_mode) {
-        dc->addr_size = override_address_size ? 4 : 8;
-    } else {
-        int use_16bit_addresses = default_16bit ^ override_address_size;
-        dc->addr_size = use_16bit_addresses ? 2 : 4;
+    rc = em_emulate_insn(em_ctxt);
+    if (rc < 0) {
+        vcpu_set_panic(vcpu);
+        hax_log(HAX_LOGPANIC, "em_emulate_insn() failed: vcpu_id=%u,"
+                " len=%u, CS:IP=0x%llx:0x%llx, instr[0..5]="
+                "0x%x 0x%x 0x%x 0x%x 0x%x 0x%x\n", vcpu->vcpu_id,
+                vcpu->vmx.exit_instr_length, cs_base, rip, instr[0],
+                instr[1], instr[2], instr[3], instr[4], instr[5]);
+        dump_vmcs(vcpu);
+        return HAX_RESUME;
     }
-
-    if (instr[num] == 0x0f) {  // Escape opcode byte
-        has_esc = true;
-        num++;
-        // TODO: Support 3-byte opcodes
-    }
-
-    // ModR/M byte is present in most instructions we deal with
-    has_modrm = true;
-    modrm.value = instr[num + 1];  // Valid only if has_modrm is true
-    sib.value = instr[num + 2];    // Valid only if has_sib is true
-
-    // Assuming ModR/M byte is valid, determine has_sib and disp_size (see IA
-    // SDM Vol. 2A 2.1.5, Table 2-1 and Table 2-2)
-    // Mod == 01b always indicates an 8-bit displacement
-    disp_size = modrm.mod == 1 ? 1 : 0;
-    if (dc->addr_size == 2) {  // 16-bit addressing
-        has_sib = false;
-        if ((modrm.mod == 0 && modrm.rm == 6) || modrm.mod == 2) {
-            disp_size = 2;
-        }
-    } else {  // 32 or 64-bit addressing
-        has_sib = modrm.mod != 3 && modrm.rm == 4;
-        // The third case is documented in the notes below IA SDM Vol. 2A 2.1.5,
-        // Table 2-3
-        if ((modrm.mod == 0 && modrm.rm == 5) || modrm.mod == 2 ||
-            (has_sib && modrm.mod == 0 && sib.base == 5)) {
-            disp_size = 4;
-        }
-    }
-
-    imm_size = 0;
-    // Parse the real opcode
-    switch (instr[num]) {
-        case 0x88:    // MOV reg => reg/mem, 8-bit
-        case 0x89:    // MOV reg => reg/mem, 16/32/64-bit
-        case 0x8a:    // MOV reg/mem => reg, 8-bit
-        case 0x8b: {  // MOV reg/mem => reg, 16/32/64-bit
-            if (modrm.mod == 3) {
-                hax_error("Unexpected reg-to-reg MOV instruction\n");
-                goto case_unexpected_opcode;
-            }
-
-            dc->opcode_dir = instr[num] == 0x88 || instr[num] == 0x89
-                             ? OPCODE_MOV_REG_TO_IOMEM
-                             : OPCODE_MOV_IOMEM_TO_REG;
-
-            dc->size = instr[num] == 0x88 || instr[num] == 0x8a
-                       ? 1 : operand_size;
-            dc->reg_index = modrm.reg + (rex_r ? 8 : 0);
-            break;
-        }
-        case 0xa0:    // MOV mem => AL
-        case 0xa1:    // MOV mem => *AX
-        case 0xa2:    // MOV AL => mem
-        case 0xa3: {  // MOV *AX => mem
-            has_modrm = false;
-            dc->opcode_dir = instr[num] == 0xa0 || instr[num] == 0xa1
-                             ? OPCODE_MOV_IOMEM_TO_REG
-                             : OPCODE_MOV_REG_TO_IOMEM;
-
-            dc->size = instr[num] == 0xa0 || instr[num] == 0xa2
-                       ? 1 : operand_size;
-            // The moffset (direct memory-offset) operand is similar to an
-            // immediate as far as instruction length calculation is concerned
-            // (see IA SDM Vol. 2A 2.2.1.4)
-            imm_size = dc->size;
-            dc->reg_index = 0;
-            break;
-        }
-        case 0xc6:    // MOV imm => reg/mem, 8-bit
-        case 0xc7: {  // MOV imm => reg/mem, 16/32-bit
-            int imm_offset;
-            uint32 imm_value;
-
-            if (modrm.reg != 0) {
-                hax_error("Invalid MOV instruction\n");
-                goto case_unexpected_opcode;
-            }
-            if (modrm.mod == 3) {
-                hax_error("Unexpected reg-to-reg MOV instruction\n");
-                goto case_unexpected_opcode;
-            }
-
-            dc->size = operand_size;
-            dc->opcode_dir = OPCODE_MOV_NUM_TO_IOMEM;
-            // In 64-bit mode, source operand is still a 32-bit immediate
-            imm_size = instr[num] == 0xc6 ? 1 : (operand_size == 2 ? 2 : 4);
-            imm_offset = num + 2;  // 1 for opcode, 1 for ModR/M
-            if (has_sib) {
-                imm_offset++;
-            }
-            imm_offset += disp_size;
-            switch (imm_size) {
-                case 1: {
-                    imm_value = *((uint8 *)&instr[imm_offset]);
-                    break;
-                }
-                case 2: {
-                    imm_value = *((uint16 *)&instr[imm_offset]);
-                    break;
-                }
-                case 4: {
-                    imm_value = *((uint32 *)&instr[imm_offset]);
-                    break;
-                }
-                default: {
-                    // Should never happen
-                    hax_error("Invalid MOV instruction\n");
-                    goto case_unexpected_opcode;
-                }
-            }
-            if (operand_size == 8) {
-                // In 64-bit mode, the 32-bit immediate is sign-extended
-                int64 imm_signed = (int32)imm_value;
-                dc->value = (uint64)imm_signed;
-            } else {
-                dc->value = imm_value;
-            }
-            break;
-        }
-        case 0xaa:    // STOSB
-        case 0xab: {  // STOSW, STOSD, STOSQ
-            has_modrm = false;
-            dc->opcode_dir = OPCODE_STOS;
-            dc->reg_index = 0;  // Source operand of STOS is always AL/*AX
-            dc->size = instr[num] == 0xaa ? 1 : operand_size;
-            break;
-        }
-        case 0xa4:    // MOVSB
-        case 0xa5: {  // MOVSW, MOVSD, MOVSQ
-            vaddr_t src_va, dst_va;
-            paddr_t src_pa, dst_pa;
-            bool is_src_mmio, is_dst_mmio;
-
-            has_modrm = false;
-            if (is_64bit_mode) {
-                src_va = dc->addr_size == 8
-                         ? vcpu->state->_rsi : vcpu->state->_esi;
-                dst_va = dc->addr_size == 8
-                         ? vcpu->state->_rdi : vcpu->state->_edi;
-            } else {
-                // Source segment defaults to DS but may be overridden
-                uint64 src_base;
-                // Destination segment is always ES
-                uint64 dst_base = vcpu->state->_es.base;
-                switch (override_segment) {
-                    case PF_SEG_OVERRIDE_CS: {
-                        src_base = vcpu->state->_cs.base;
-                        break;
-                    }
-                    case PF_SEG_OVERRIDE_SS: {
-                        src_base = vcpu->state->_ss.base;
-                        break;
-                    }
-                    case PF_SEG_OVERRIDE_ES: {
-                        src_base = vcpu->state->_es.base;
-                        break;
-                    }
-                    case PF_SEG_OVERRIDE_FS: {
-                        src_base = vcpu->state->_fs.base;
-                        break;
-                    }
-                    case PF_SEG_OVERRIDE_GS: {
-                        src_base = vcpu->state->_gs.base;
-                        break;
-                    }
-                    default: {
-                        src_base = vcpu->state->_ds.base;
-                        break;
-                    }
-                }
-                src_va = dc->addr_size == 2 ? (src_base + vcpu->state->_si)
-                         : (src_base + vcpu->state->_esi);
-                dst_va = dc->addr_size == 2 ? (dst_base + vcpu->state->_di)
-                         : (dst_base + vcpu->state->_edi);
-            }
-            src_pa = dst_pa = 0xffffffffffffffffULL;
-            // TODO: Can vcpu_translate() fail?
-            vcpu_translate(vcpu, src_va, 0, &src_pa, NULL, true);
-            vcpu_translate(vcpu, dst_va, 0, &dst_pa, NULL, true);
-            is_src_mmio = src_pa == dc->gpa || is_mmio_address(vcpu, src_pa);
-            is_dst_mmio = dst_pa == dc->gpa || is_mmio_address(vcpu, dst_pa);
-            if (is_src_mmio && is_dst_mmio) {
-                dc->opcode_dir = OPCODE_MOVS_IOMEM_TO_IOMEM;
-                dc->src_pa = src_pa;
-                dc->dst_pa = dst_pa;
-            } else if (is_dst_mmio) {
-                dc->opcode_dir = OPCODE_MOVS_MEM_TO_IOMEM;
-                dc->va = src_va;
-            } else {
-                // is_src_mmio
-                dc->opcode_dir = OPCODE_MOVS_IOMEM_TO_MEM;
-                dc->va = dst_va;
-            }
-            dc->size = instr[num] == 0xa4 ? 1 : operand_size;
-            break;
-        }
-        case 0xb6:    // MOVZX, 8-bit to 16/32/64-bit
-        case 0xb7: {  // MOVZX, 16-bit to 32/64-bit
-            if (!has_esc) {
-                hax_error("Invalid MOVZX instruction: missing 0x0f\n");
-                goto case_unexpected_opcode;
-            }
-            if (modrm.mod == 3) {
-                hax_error("Unexpected reg-to-reg MOVZX instruction\n");
-                goto case_unexpected_opcode;
-            }
-
-            dc->opcode_dir = OPCODE_MOVZX_IOMEM_TO_REG;
-            dc->size = instr[num] == 0xb6 ? 1 : 2;  // Source operand size
-            // Destination operand size does not really matter; the value is
-            // always zero-extended to 64 bits
-            dc->reg_index = modrm.reg + (rex_r ? 8 : 0);
-            break;
-        }
-        // TODO: Handle 0x20, 0x21, 0x80 (/4), 0x81 (/4) and 0x83 (/4)
-        case 0x22:    // AND reg/mem => reg, 8-bit
-        case 0x23: {  // AND reg/mem => reg, 16/32/64-bit
-            if (modrm.mod == 3) {
-                hax_error("Unexpected reg-to-reg AND instruction\n");
-                goto case_unexpected_opcode;
-            }
-
-            dc->opcode_dir = OPCODE_AND_IOMEM_TO_REG;
-            dc->size = instr[num] == 0x22 ? 1 : operand_size;
-            dc->reg_index = modrm.reg + (rex_r ? 8 : 0);
-            break;
-        }
-        // TODO: Handle 0x08, 0x09, 0x80 (/1), 0x81 (/1) and 0x83 (/1)
-        case 0x0a:    // OR reg/mem => reg, 8-bit
-        case 0x0b: {  // OR reg/mem => reg, 16/32/64-bit
-            if (modrm.mod == 3) {
-                hax_error("Unexpected reg-to-reg OR instruction\n");
-                goto case_unexpected_opcode;
-            }
-
-            dc->opcode_dir = OPCODE_OR_IOMEM_TO_REG;
-            dc->size = instr[num] == 0x0a ? 1 : operand_size;
-            dc->reg_index = modrm.reg + (rex_r ? 8 : 0);
-            break;
-        }
-        // TODO: Handle 0x30, 0x31, 0x80 (/6), 0x81 (/6) and 0x83 (/6)
-        case 0x32:    // XOR reg/mem => reg, 8-bit
-        case 0x33: {  // XOR reg/mem => reg, 16/32/64-bit
-            if (modrm.mod == 3) {
-                hax_error("Unexpected reg-to-reg XOR instruction\n");
-                goto case_unexpected_opcode;
-            }
-
-            dc->opcode_dir = OPCODE_XOR_IOMEM_TO_REG;
-            dc->size = instr[num] == 0x32 ? 1 : operand_size;
-            dc->reg_index = modrm.reg + (rex_r ? 8 : 0);
-            break;
-        }
-case_unexpected_opcode:
-        default: {
-            hax_panic_vcpu(vcpu, "Unexpected MMIO instruction (opcode=0x%x,"
-                           " exit_instr_length=%u, num=%d, gpa=0x%llx,"
-                           " instr[0..5]=0x%x 0x%x 0x%x 0x%x 0x%x 0x%x)\n",
-                           instr[num], vcpu->vmx.exit_instr_length, num,
-                           dc->gpa, instr[0], instr[1], instr[2], instr[3],
-                           instr[4], instr[5]);
-            dump_vmcs(vcpu);
-            return -1;
-        }
-    }
-
-    // Calculate instruction length
-    len = (uint8)(num + 1);  // 1 for opcode
-    if (has_modrm) {
-        len++;
-        if (has_sib) {
-            len++;
-        }
-        len += disp_size;
-    }
-    len += imm_size;
-
-    if (len != vcpu->vmx.exit_instr_length) {
-        hax_debug("Inferred instruction length %u does not match VM-exit"
-                  " instruction length %u (CS:IP=0x%llx:0x%llx, instr[0..5]="
-                  "0x%x 0x%x 0x%x 0x%x 0x%x 0x%x)\n", len,
-                  vcpu->vmx.exit_instr_length, cs_base, rip, instr[0], instr[1],
-                  instr[2], instr[3], instr[4], instr[5]);
-    }
-    dc->advance = len;
-    return 0;
+    return HAX_EXIT;
 }
 
-static int hax_setup_fastmmio(struct vcpu_t *vcpu, struct hax_tunnel *htun,
-                              struct decode *dec)
+static uint64_t vcpu_read_gpr(void *obj, uint32_t reg_index)
 {
+    struct vcpu_t *vcpu = obj;
+    if (reg_index >= 16) {
+        vcpu_set_panic(vcpu);
+        hax_log(HAX_LOGPANIC, "vcpu_read_gpr: Invalid register index\n");
+        return 0;
+    }
+    return vcpu->state->_regs[reg_index];
+}
+
+static void vcpu_write_gpr(void *obj, uint32_t reg_index, uint64_t value)
+{
+    struct vcpu_t *vcpu = obj;
+    if (reg_index >= 16) {
+        vcpu_set_panic(vcpu);
+        hax_log(HAX_LOGPANIC, "vcpu_write_gpr: Invalid register index\n");
+        return;
+    }
+    vcpu->state->_regs[reg_index] = value;
+}
+
+uint64_t vcpu_read_rflags(void *obj)
+{
+    struct vcpu_t *vcpu = obj;
+    return vcpu->state->_rflags;
+}
+
+void vcpu_write_rflags(void *obj, uint64_t value)
+{
+    struct vcpu_t *vcpu = obj;
+    vcpu->state->_rflags = value;
+    vcpu->rflags_dirty = 1;
+}
+
+static uint64_t vcpu_get_segment_base(void *obj, uint32_t segment)
+{
+    struct vcpu_t *vcpu = obj;
+    switch (segment) {
+    case SEG_CS:
+        return vcpu->state->_cs.base;
+    case SEG_DS:
+        return vcpu->state->_ds.base;
+    case SEG_ES:
+        return vcpu->state->_es.base;
+    case SEG_FS:
+        return vcpu->state->_fs.base;
+    case SEG_GS:
+        return vcpu->state->_gs.base;
+    case SEG_SS:
+        return vcpu->state->_ss.base;
+    default:
+        return vcpu->state->_ds.base;
+    }
+}
+
+static void vcpu_advance_rip(void *obj, uint64_t len)
+{
+    struct vcpu_t *vcpu = obj;
+    advance_rip(vcpu);
+}
+
+static em_status_t vcpu_read_memory(void *obj, uint64_t ea, uint64_t *value,
+                                    uint32_t size, uint32_t flags)
+{
+    struct vcpu_t *vcpu = obj;
+    uint64_t pa;
+
+    if (flags & EM_OPS_NO_TRANSLATION) {
+        pa = vmx(vcpu, exit_gpa);
+    } else {
+        vcpu_translate(vcpu, ea, 0, &pa, NULL, false);
+    }
+
+    // Assume that instructions that don't require translation access MMIO
+    if (flags & EM_OPS_NO_TRANSLATION || is_mmio_address(vcpu, pa)) {
+        struct hax_tunnel *htun = vcpu->tunnel;
+        struct hax_fastmmio *hft = (struct hax_fastmmio *)vcpu->io_buf;
+        htun->_exit_status = HAX_EXIT_FAST_MMIO;
+        hft->gpa = pa;
+        hft->size = size;
+        hft->direction = 0;
+        return EM_EXIT_MMIO;
+    } else {
+        if (!vcpu_read_guest_virtual(vcpu, ea, value, size, size, 0)) {
+            return EM_ERROR;
+        }
+        return EM_CONTINUE;
+    }
+}
+
+static em_status_t vcpu_read_memory_post(void *obj,
+                                         uint64_t *value, uint32_t size)
+{
+    struct vcpu_t *vcpu = obj;
     struct hax_fastmmio *hft = (struct hax_fastmmio *)vcpu->io_buf;
-    struct vcpu_state_t *state = vcpu->state;
-    bool advance = true;
-    uint8_t buf[8] = { 0 };
+    memcpy(value, &hft->value, size);
+    return EM_CONTINUE;
+}
 
-    htun->_exit_status = HAX_EXIT_FAST_MMIO;
-    hft->gpa = dec->gpa;
-    hft->size = dec->size;
+static em_status_t vcpu_write_memory(void *obj, uint64_t ea, uint64_t *value,
+                                     uint32_t size, uint32_t flags)
+{
+    struct vcpu_t *vcpu = obj;
+    uint64_t pa;
 
-    hft->reg_index = 0;
-    hft->value = 0;
-    vcpu->post_mmio.op = VCPU_POST_MMIO_NOOP;
-
-    switch (dec->opcode_dir) {
-        case OPCODE_MOV_REG_TO_IOMEM:
-        case OPCODE_STOS: {
-            hft->value = vcpu->state->_regs[dec->reg_index];
-            hft->direction = 1;
-            break;
-        }
-        case OPCODE_MOV_IOMEM_TO_REG:
-        case OPCODE_MOVZX_IOMEM_TO_REG:
-        case OPCODE_AND_IOMEM_TO_REG:
-        case OPCODE_OR_IOMEM_TO_REG:
-        case OPCODE_XOR_IOMEM_TO_REG: {
-            vcpu->post_mmio.op = VCPU_POST_MMIO_WRITE_REG;
-            vcpu->post_mmio.reg_index = dec->reg_index;
-            hft->direction = 0;
-            break;
-        }
-        case OPCODE_MOV_NUM_TO_IOMEM: {
-            hft->value = dec->value;
-            hft->direction = 1;
-            break;
-        }
-        case OPCODE_MOVS_MEM_TO_IOMEM: {
-            // Source operand (saved in dec->va) is a non-I/O GVA
-            if (!vcpu_read_guest_virtual(vcpu, dec->va, buf, 8, dec->size, 0)) {
-                hax_panic_vcpu(vcpu, "Error reading %u bytes from guest RAM"
-                               " (va=0x%llx, DS:RSI=0x%llx:0x%llx)\n",
-                               dec->size, dec->va, vcpu->state->_ds.base,
-                               vcpu->state->_rsi);
-                dump_vmcs(vcpu);
-                return -1;
-            }
-            hft->value = *((uint64 *)buf);  // Assume little-endian
-            hft->direction = 1;
-            break;
-        }
-        case OPCODE_MOVS_IOMEM_TO_MEM: {
-            // Destination operand (saved in dec->va) is a non-I/O GVA
-            vcpu->post_mmio.op = VCPU_POST_MMIO_WRITE_MEM;
-            vcpu->post_mmio.va = dec->va;
-            hft->direction = 0;
-            break;
-        }
-        case OPCODE_MOVS_IOMEM_TO_IOMEM: {
-            if (!qemu_support_fastmmio_extra(vcpu)) {
-                hax_panic_vcpu(vcpu, "MOVS between two MMIO addresses requires"
-                               " a newer version of QEMU HAXM module.\n");
-                dump_vmcs(vcpu);
-                return -1;
-            }
-            if (dec->src_pa == dec->gpa) {
-                hft->direction = 2;
-                hft->gpa2 = dec->dst_pa;
-            } else {
-                hft->direction = 3;
-                hft->gpa2 = dec->src_pa;
-                hax_warning("MOVS MMIO=>MMIO in reverse direction!\n");
-            }
-            break;
-        }
-        default: {
-            hax_panic_vcpu(vcpu, "Unsupported MMIO operation %d\n",
-                           dec->opcode_dir);
-            dump_vmcs(vcpu);
-            return -1;
-        }
+    if (flags & EM_OPS_NO_TRANSLATION) {
+        pa = vmx(vcpu, exit_gpa);
+    } else {
+        vcpu_translate(vcpu, ea, 0, &pa, NULL, false);
     }
 
-    // Set up additional post-MMIO fields for value manipulation
-    switch (dec->opcode_dir) {
-        case OPCODE_AND_IOMEM_TO_REG: {
-            vcpu->post_mmio.manip = VCPU_POST_MMIO_MANIP_AND;
-            read_low_bits(&vcpu->post_mmio.value,
-                          vcpu->state->_regs[dec->reg_index], dec->size);
-            break;
+    // Assume that instructions that don't require translation access MMIO
+    if (flags & EM_OPS_NO_TRANSLATION || is_mmio_address(vcpu, pa)) {
+        struct hax_tunnel *htun = vcpu->tunnel;
+        struct hax_fastmmio *hft = (struct hax_fastmmio *)vcpu->io_buf;
+        htun->_exit_status = HAX_EXIT_FAST_MMIO;
+        hft->gpa = pa;
+        hft->size = size;
+        hft->value = *value;
+        hft->direction = 1;
+        return EM_EXIT_MMIO;
+    } else {
+        if (!vcpu_write_guest_virtual(vcpu, ea, size, value, size, 0)) {
+            return EM_ERROR;
         }
-        case OPCODE_OR_IOMEM_TO_REG: {
-            vcpu->post_mmio.manip = VCPU_POST_MMIO_MANIP_OR;
-            read_low_bits(&vcpu->post_mmio.value,
-                          vcpu->state->_regs[dec->reg_index], dec->size);
-            break;
-        }
-        case OPCODE_XOR_IOMEM_TO_REG: {
-            vcpu->post_mmio.manip = VCPU_POST_MMIO_MANIP_XOR;
-            read_low_bits(&vcpu->post_mmio.value,
-                          vcpu->state->_regs[dec->reg_index], dec->size);
-            break;
-        }
-        default: {
-            vcpu->post_mmio.manip = VCPU_POST_MMIO_MANIP_NONE;
-            vcpu->post_mmio.value = 0;
-            break;
-        }
+        return EM_CONTINUE;
     }
+}
 
-    state = vcpu->state;
-    hft->_cr0 = state->_cr0;
-    hft->_cr2 = state->_cr2;
-    hft->_cr3 = state->_cr3;
-    hft->_cr4 = state->_cr4;
+static const struct em_vcpu_ops_t em_ops = {
+    .read_gpr = vcpu_read_gpr,
+    .write_gpr = vcpu_write_gpr,
+    .read_rflags = vcpu_read_rflags,
+    .write_rflags = vcpu_write_rflags,
+    .get_segment_base = vcpu_get_segment_base,
+    .advance_rip = vcpu_advance_rip,
+    .read_memory = vcpu_read_memory,
+    .read_memory_post = vcpu_read_memory_post,
+    .write_memory = vcpu_write_memory,
+};
 
-    if (dec->opcode_dir == OPCODE_STOS ||
-        (dec->opcode_dir >= OPCODE_MOVS_MEM_TO_IOMEM &&
-        dec->opcode_dir <= OPCODE_MOVS_IOMEM_TO_IOMEM)) {
-        // STOS and MOVS require incrementing (DF=0) or decrementing (DF=1) *DI
-        // MOVS also requires incrementing (DF=0) or decrementing (DF=1) *SI
-        int df = (int)(state->_rflags & 0x0400);
-        if (df) {
-            state->_rdi -= dec->size;
-            if (dec->opcode_dir >= OPCODE_MOVS_MEM_TO_IOMEM &&
-                dec->opcode_dir <= OPCODE_MOVS_IOMEM_TO_IOMEM) {
-                state->_rsi -= dec->size;
-            }
-        } else {
-            state->_rdi += dec->size;
-            if (dec->opcode_dir >= OPCODE_MOVS_MEM_TO_IOMEM &&
-                dec->opcode_dir <= OPCODE_MOVS_IOMEM_TO_IOMEM) {
-                state->_rsi += dec->size;
-            }
-        }
-    }
+static void vcpu_init_emulator(struct vcpu_t *vcpu)
+{
+    struct em_context_t *em_ctxt = &vcpu->emulate_ctxt;
 
-    if (dec->has_rep) {
-        // REP means the instruction is to be repeated *CX times
-        // The exact *CX (CX/ECX/RCX) is determined by the address size
-        advance = false;
-        switch (dec->addr_size) {
-            case 2: {
-                if (--state->_cx == 0) {
-                    advance = true;
-                }
-                break;
-            }
-            case 4: {
-                if (--state->_ecx == 0) {
-                    advance = true;
-                }
-                break;
-            }
-            case 8: {
-                if (--state->_rcx == 0) {
-                    advance = true;
-                }
-                break;
-            }
-            default: {
-                hax_panic_vcpu(vcpu, "Invalid address size %u\n",
-                               dec->addr_size);
-                dump_vmcs(vcpu);
-                return -1;
-            }
-        }
-    }
-    advance_rip_step(vcpu, advance ? dec->advance : 0);
-    return 0;
+    memset(em_ctxt, 0, sizeof(*em_ctxt));
+    em_ctxt->vcpu = vcpu;
+    em_ctxt->ops = &em_ops;
+    em_ctxt->finished = true;
 }
 
 static int exit_exc_nmi(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 {
     struct vcpu_state_t *state = vcpu->state;
     interruption_info_t exit_intr_info;
-    uint64 cr0;
 
     exit_intr_info.raw = vmx(vcpu, exit_intr_info).raw;
     htun->_exit_reason = vmx(vcpu, exit_reason).basic_reason;
-    hax_debug("exception vmexit vector:%x\n", exit_intr_info.vector);
+    hax_log(HAX_LOGD, "exception vmexit vector:%x\n", exit_intr_info.vector);
 
     switch (exit_intr_info.vector) {
-        case EXC_NMI: {
+        case VECTOR_NMI: {
             __nmi();
             return HAX_RESUME;
         }
-        case EXC_PAGEFAULT: {
+        case VECTOR_PF: {
             if (vtlb_active(vcpu)) {
                 if (handle_vtlb(vcpu))
                     return HAX_RESUME;
 
-                paddr_t pa;
-                struct decode dec;
-                int ret;
-                vaddr_t cr2 = vmx(vcpu, exit_qualification).address;
-
-                ret = vcpu_simple_decode(vcpu, &dec);
-                if (ret < 0) {
-                    // vcpu_simple_decode() has called hax_panic_vcpu()
-                    return HAX_RESUME;
-                } else if (ret > 0) {
-                    handle_mem_fault(vcpu, htun);
-                } else {
-                    vcpu_translate(vcpu, cr2, 0, &pa, (uint64_t *)NULL, 0);
-                    dec.gpa = pa & 0xffffffff;
-                    if (hax_setup_fastmmio(vcpu, htun, &dec)) {
-                        // hax_setup_fastmmio() has called hax_panic_vcpu()
-                        return HAX_RESUME;
-                    }
-                }
-                return HAX_EXIT;
+                return vcpu_emulate_insn(vcpu);
             } else {
-                hax_panic_vcpu(vcpu, "Page fault shouldn't happen when EPT is "
-                               "enabled.\n");
+                vcpu_set_panic(vcpu);
+                hax_log(HAX_LOGPANIC, "Page fault shouldn't happen when EPT is"
+                        " enabled.\n");
                 dump_vmcs(vcpu);
             }
             break;
         }
-        case EXC_NOMATH: {
-            cr0 = vcpu_read_cr(state, 0);
-            if (cr0 & CR0_TS) {
-                uint32 exc_bitmap = vmx(vcpu, exc_bitmap);
-                if (!vcpu->is_fpu_used) {
-                    vcpu->is_fpu_used = 1;
-                }
-                exc_bitmap &= ~(1u << EXC_NOMATH);
-                vmwrite(vcpu, VMX_EXCEPTION_BITMAP,
-                        vmx(vcpu, exc_bitmap) = exc_bitmap);
-            }
-            return HAX_RESUME;
-        }
-        case EXC_MACHINE_CHECK: {
-            hax_panic_vcpu(vcpu, "Machine check happens!\n");
+        case VECTOR_MC: {
+            vcpu_set_panic(vcpu);
+            hax_log(HAX_LOGPANIC, "Machine check happens!\n");
             dump_vmcs(vcpu);
             handle_machine_check(vcpu);
             break;
         }
-        case EXC_DOUBLEFAULT: {
-            hax_panic_vcpu(vcpu, "Double fault!\n");
+        case VECTOR_DF: {
+            vcpu_set_panic(vcpu);
+            hax_log(HAX_LOGPANIC, "Double fault!\n");
             dump_vmcs(vcpu);
             break;
         }
+        case VECTOR_DB: {
+            htun->_exit_status = HAX_EXIT_DEBUG;
+            htun->debug.rip = vcpu->state->_rip;
+            htun->debug.dr6 = vmx(vcpu, exit_qualification).raw;
+            htun->debug.dr7 = vmread(vcpu, GUEST_DR7);
+            return HAX_EXIT;
+        }
+        case VECTOR_BP: {
+            htun->_exit_status = HAX_EXIT_DEBUG;
+            htun->debug.rip = vcpu->state->_rip;
+            htun->debug.dr6 = 0;
+            htun->debug.dr7 = 0;
+            return HAX_EXIT;
+        }
     }
 
-    if (exit_intr_info.vector == EXC_PAGEFAULT) {
+    if (exit_intr_info.vector == VECTOR_PF) {
         state->_cr2 = vmx(vcpu, exit_qualification.address);
     }
 
@@ -2687,11 +2414,11 @@ static int exit_exc_nmi(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 static void handle_machine_check(struct vcpu_t *vcpu)
 {
     // Dump machine check MSRs
-    uint64 mcg_cap = ia32_rdmsr(IA32_MCG_CAP);
+    uint64_t mcg_cap = ia32_rdmsr(IA32_MCG_CAP);
     uint n, i;
 
 #define MSR_TRACE(msr) \
-        hax_debug("MSR %s (%x): %08llx\n", #msr, msr, ia32_rdmsr(msr))
+        hax_log(HAX_LOGD, "MSR %s (%x): %08llx\n", #msr, msr, ia32_rdmsr(msr))
 
     MSR_TRACE(IA32_MCG_CAP);
     MSR_TRACE(IA32_MCG_STATUS);
@@ -2700,17 +2427,17 @@ static void handle_machine_check(struct vcpu_t *vcpu)
     }
 
 #define MSR_TRACEi(n, a)                                               \
-        hax_debug("MSR IA32_MC%d_%s (%x): %08llx\n", i, #n, a + i * 4, \
-                  ia32_rdmsr(a + i * 4))
+        hax_log(HAX_LOGD, "MSR IA32_MC%d_%s (%x): %08llx\n", i, #n, \
+                a + i * 4, ia32_rdmsr(a + i * 4))
 
     n = mcg_cap & 0xff;
     for (i = 0; i < n; i++) {
         MSR_TRACEi(CTL, IA32_MC0_CTL);
         MSR_TRACEi(STATUS, IA32_MC0_STATUS);
-        if (ia32_rdmsr(IA32_MC0_STATUS + i * 4) & ((uint64)1 << 58)) {
+        if (ia32_rdmsr(IA32_MC0_STATUS + i * 4) & ((uint64_t)1 << 58)) {
             MSR_TRACEi(ADDR, IA32_MC0_ADDR);
         }
-        if (ia32_rdmsr(IA32_MC0_STATUS + i * 4) & ((uint64)1 << 59)) {
+        if (ia32_rdmsr(IA32_MC0_STATUS + i * 4) & ((uint64_t)1 << 59)) {
             MSR_TRACEi(MISC, IA32_MC0_MISC);
         }
     }
@@ -2734,7 +2461,7 @@ static void handle_machine_check(struct vcpu_t *vcpu)
 #undef MSR_TRACE
 #undef MSR_TRACEi
 
-    hax_warning("Machine check");
+    hax_log(HAX_LOGW, "Machine check");
 }
 
 static int exit_interrupt(struct vcpu_t *vcpu, struct hax_tunnel *htun)
@@ -2746,7 +2473,8 @@ static int exit_interrupt(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 
 static int exit_triple_fault(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 {
-    hax_panic_vcpu(vcpu, "Triple fault\n");
+    vcpu_set_panic(vcpu);
+    hax_log(HAX_LOGPANIC, "Triple fault\n");
     dump_vmcs(vcpu);
     return HAX_RESUME;
 }
@@ -2754,10 +2482,10 @@ static int exit_triple_fault(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 static int exit_interrupt_window(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 {
     vmx(vcpu, pcpu_ctls) &=
-            vmx(vcpu, exit_reason).basic_reason == PENDING_INTERRUPT
+            vmx(vcpu, exit_reason).basic_reason == VMX_EXIT_PENDING_INTERRUPT
             ? ~INTERRUPT_WINDOW_EXITING : ~NMI_WINDOW_EXITING;
 
-    vmwrite(vcpu, VMX_PRIMARY_PROCESSOR_CONTROLS, vmx(vcpu, pcpu_ctls));
+    vcpu->pcpu_ctls_dirty = 1;
     htun->_exit_reason = vmx(vcpu, exit_reason).basic_reason;
     return HAX_RESUME;
 }
@@ -2766,73 +2494,87 @@ static int exit_cpuid(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 {
     handle_cpuid(vcpu, htun);
     advance_rip(vcpu);
-    hax_debug("...........exit_cpuid\n");
+    hax_log(HAX_LOGD, "...........exit_cpuid\n");
     return HAX_RESUME;
 }
 
 static void handle_cpuid(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 {
     struct vcpu_state_t *state = vcpu->state;
-    uint32 a = state->_eax, c = state->_ecx;
+    uint32_t a = state->_eax, c = state->_ecx;
+    cpuid_args_t args;
 
-    __handle_cpuid(state);
+    args.eax = state->_eax;
+    args.ecx = state->_ecx;
+    asm_cpuid(&args);
+    state->_eax = args.eax;
+    state->_ecx = args.ecx;
+    state->_edx = args.edx;
+    state->_ebx = args.ebx;
 
     handle_cpuid_virtual(vcpu, a, c);
 
-    hax_debug("CPUID %08x %08x: %08x %08x %08x %08x\n", a, c, state->_eax,
-              state->_ebx, state->_ecx, state->_edx);
+    hax_log(HAX_LOGD, "CPUID %08x %08x: %08x %08x %08x %08x\n", a, c,
+            state->_eax, state->_ebx, state->_ecx, state->_edx);
     htun->_exit_reason = vmx(vcpu, exit_reason).basic_reason;
 }
 
-static void handle_cpuid_virtual(struct vcpu_t *vcpu, uint32 a, uint32 c)
+static void handle_cpuid_virtual(struct vcpu_t *vcpu, uint32_t a, uint32_t c)
 {
 #define VIRT_FAMILY     0x6
 #define VIRT_MODEL      0x1F
 #define VIRT_STEPPING   0x1
     struct vcpu_state_t *state = vcpu->state;
-    uint32 hw_family;
-    uint32 hw_model;
+    uint32_t hw_family;
+    uint32_t hw_model;
+    uint8_t physical_address_size;
 
-    static uint32 cpu_features_1 =
+    static uint32_t cpu_features_1 =
             // pat is disabled!
-            feat_fpu        |
-            feat_vme        |
-            feat_de         |
-            feat_tsc        |
-            feat_msr        |
-            feat_pae        |
-            feat_mce        |
-            feat_cx8        |
-            feat_apic       |
-            feat_sep        |
-            feat_mtrr       |
-            feat_pge        |
-            feat_mca        |
-            feat_cmov       |
-            feat_clfsh      |
-            feat_mmx        |
-            feat_fxsr       |
-            feat_sse        |
-            feat_sse2       |
-            feat_ss         |
-            feat_pse        |
-            feat_htt;
+            FEATURE(FPU)        |
+            FEATURE(VME)        |
+            FEATURE(DE)         |
+            FEATURE(TSC)        |
+            FEATURE(MSR)        |
+            FEATURE(PAE)        |
+            FEATURE(MCE)        |
+            FEATURE(CX8)        |
+            FEATURE(APIC)       |
+            FEATURE(SEP)        |
+            FEATURE(MTRR)       |
+            FEATURE(PGE)        |
+            FEATURE(MCA)        |
+            FEATURE(CMOV)       |
+            FEATURE(CLFSH)      |
+            FEATURE(MMX)        |
+            FEATURE(FXSR)       |
+            FEATURE(SSE)        |
+            FEATURE(SSE2)       |
+            FEATURE(SS)         |
+            FEATURE(PSE)        |
+            FEATURE(HTT);
 
-    static uint32 cpu_features_2 =
-            feat_sse3       |
-            feat_ssse3      |
-            feat_sse41      |
-            feat_sse42      |
-            feat_cmpxchg16b |
-            feat_movbe      |
-            feat_popcnt;
+    static uint32_t cpu_features_2 =
+            FEATURE(SSE3)       |
+            FEATURE(SSSE3)      |
+            FEATURE(SSE41)      |
+            FEATURE(SSE42)      |
+            FEATURE(CMPXCHG16B) |
+            FEATURE(MOVBE)      |
+            FEATURE(POPCNT);
 
-    uint32 cpu_features_ext =
-            // no NX
-            feat_syscall    |
-            feat_em64t;
+    uint32_t cpu_features_ext =
+            FEATURE(NX)         |
+            FEATURE(SYSCALL)    |
+            FEATURE(EM64T);
 
-    uint8 physical_address_size;
+    // Conditional features
+    if (cpu_has_feature(X86_FEATURE_AESNI)) {
+        cpu_features_2 |= FEATURE(AESNI);
+    }
+    if (cpu_has_feature(X86_FEATURE_RDTSCP)) {
+        cpu_features_ext |= FEATURE(RDTSCP);
+    }
 
     switch (a) {
         case 0: {                       // Maximum Basic Information
@@ -2887,7 +2629,7 @@ static void handle_cpuid_virtual(struct vcpu_t *vcpu, uint32 a, uint32 c)
             // supported by the host CPU, but including "hypervisor", which is
             // desirable for VMMs.
             // TBD: This will need to be changed to emulate new features.
-            state->_ecx = (cpu_features_2 & state->_ecx) | feat_hypervisor;
+            state->_ecx = (cpu_features_2 & state->_ecx) | FEATURE(HYPERVISOR);
             state->_edx = cpu_features_1 & state->_edx;
             return;
         }
@@ -2937,7 +2679,7 @@ static void handle_cpuid_virtual(struct vcpu_t *vcpu, uint32 a, uint32 c)
             // ECX and EDX represent the underlying VMM's vendor ID and should
             // be overridden.
             static const char vmm_vendor_id[13] = "HAXMHAXMHAXM";
-            const uint32 *p = (const uint32 *)vmm_vendor_id;
+            const uint32_t *p = (const uint32_t *)vmm_vendor_id;
             // Some VMMs use EAX to indicate the maximum CPUID leaf valid for
             // the range of [0x40000000, 0x4fffffff]
             state->_eax = 0x40000000;
@@ -3002,7 +2744,7 @@ static void handle_cpuid_virtual(struct vcpu_t *vcpu, uint32 a, uint32 c)
         case 0x80000008: {              // Virtual/Physical Address Size
             // Bit mask to identify the reserved bits in paging structure high
             // order address field
-            physical_address_size = (uint8)state->_eax & 0xff;
+            physical_address_size = (uint8_t)state->_eax & 0xff;
             pw_reserved_bits_high_mask =
                     ~((1 << (physical_address_size - 32)) - 1);
 
@@ -3037,11 +2779,11 @@ static int exit_invlpg(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 
 static int exit_rdtsc(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 {
-    hax_debug("rdtsc exiting: rip: %llx\n", vcpu->state->_rip);
+    hax_log(HAX_LOGD, "rdtsc exiting: rip: %llx\n", vcpu->state->_rip);
     return HAX_RESUME;
 }
 
-static void check_flush(struct vcpu_t *vcpu, uint32 bits)
+static void check_flush(struct vcpu_t *vcpu, uint32_t bits)
 {
     switch (vmx(vcpu, exit_qualification).cr.creg) {
         case 0: {
@@ -3071,44 +2813,49 @@ static void check_flush(struct vcpu_t *vcpu, uint32 bits)
 
 static int exit_cr_access(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 {
-    uint64 cr_ptr;
     int cr;
     struct vcpu_state_t *state = vcpu->state;
     bool is_ept_pae = false;
     preempt_flag flags;
-    uint32 vmcs_err = 0;
+    uint32_t vmcs_err = 0;
 
     htun->_exit_reason = vmx(vcpu, exit_reason).basic_reason;
 
     cr = vmx(vcpu, exit_qualification).cr.creg;
-    cr_ptr = vcpu_read_cr(state, cr);
 
     switch (vmx(vcpu, exit_qualification).cr.type) {
         case 0: { // MOV CR <- GPR
-            uint64 val = state->_regs[(vmx(vcpu, exit_qualification).cr.gpr)];
+            uint64_t val = state->_regs[(vmx(vcpu, exit_qualification).cr.gpr)];
+            uint64_t old_val = 0;
 
-            hax_debug("cr_access W CR%d: %08llx -> %08llx\n", cr, cr_ptr, val);
+            if (cr == 8) {
+                // TODO: Redirect CR8 write to user space (emulated APIC.TPR)
+                hax_log(HAX_LOGW, "Ignored guest CR8 write, val=0x%llx\n", val);
+                break;
+            }
+
+            old_val = vcpu_read_cr(state, cr);
             if (cr == 0) {
-                uint64 cr0_pae_triggers;
+                uint64_t cr0_pae_triggers;
 
-                hax_info("Guest writing to CR0[%u]: 0x%llx -> 0x%llx,"
-                         " _cr4=0x%llx, _efer=0x%x\n", vcpu->vcpu_id,
-                         state->_cr0, val, state->_cr4, state->_efer);
+                hax_log(HAX_LOGI, "Guest writing to CR0[%u]: 0x%llx -> 0x%llx,"
+                        " _cr4=0x%llx, _efer=0x%x\n", vcpu->vcpu_id,
+                        old_val, val, state->_cr4, state->_efer);
                 if ((val & CR0_PG) && !(val & CR0_PE)) {
-                    hax_inject_exception(vcpu, EXC_GENERAL_PROTECTION, 0);
+                    hax_inject_exception(vcpu, VECTOR_GP, 0);
                     return HAX_RESUME;
                 }
                 if (!(state->_cr0 & CR0_PG) && (val & CR0_PG) &&
                     (state->_efer & IA32_EFER_LME)) {
                     if (!(state->_cr4 & CR4_PAE)) {
-                        hax_inject_exception(vcpu, EXC_GENERAL_PROTECTION, 0);
+                        hax_inject_exception(vcpu, VECTOR_GP, 0);
                         return HAX_RESUME;
                     }
                 }
-                if (!hax->ug_enable_flag && (cr_ptr & CR0_PE) &&
+                if (!hax->ug_enable_flag && (old_val & CR0_PE) &&
                     !(val & CR0_PE)) {
                     htun->_exit_status = HAX_EXIT_REALMODE;
-                    hax_debug("Enter NON-PE from PE\n");
+                    hax_log(HAX_LOGD, "Enter NON-PE from PE\n");
                     return HAX_EXIT;
                 }
 
@@ -3116,21 +2863,20 @@ static int exit_cr_access(struct vcpu_t *vcpu, struct hax_tunnel *htun)
                 cr0_pae_triggers = CR0_CD | CR0_NW | CR0_PG;
                 if ((val & CR0_PG) && (state->_cr4 & CR4_PAE) &&
                     !(state->_efer & IA32_EFER_LME) && !vtlb_active(vcpu) &&
-                    ((val ^ cr_ptr) & cr0_pae_triggers)) {
-                    hax_info("%s: vCPU #%u triggers PDPT (re)load for EPT+PAE"
-                             " mode (CR0 path)\n", __func__, vcpu->vcpu_id);
+                    ((val ^ old_val) & cr0_pae_triggers)) {
+                    hax_log(HAX_LOGI, "%s: vCPU #%u triggers PDPT (re)load for"
+                            " EPT+PAE mode (CR0 path)\n", __func__,
+                            vcpu->vcpu_id);
                     is_ept_pae = true;
                 }
-            }
+            } else if (cr == 4) {
+                uint64_t cr4_pae_triggers;
 
-            if (cr == 4) {
-                uint64 cr4_pae_triggers;
-
-                hax_info("Guest writing to CR4[%u]: 0x%llx -> 0x%llx,"
-                         "_cr0=0x%llx, _efer=0x%x\n", vcpu->vcpu_id,
-                         state->_cr4, val, state->_cr0, state->_efer);
+                hax_log(HAX_LOGI, "Guest writing to CR4[%u]: 0x%llx -> 0x%llx,"
+                        "_cr0=0x%llx, _efer=0x%x\n", vcpu->vcpu_id,
+                        old_val, val, state->_cr0, state->_efer);
                 if ((state->_efer & IA32_EFER_LMA) && !(val & CR4_PAE)) {
-                    hax_inject_exception(vcpu, EXC_GENERAL_PROTECTION, 0);
+                    hax_inject_exception(vcpu, VECTOR_GP, 0);
                     return HAX_RESUME;
                 }
 
@@ -3139,18 +2885,18 @@ static int exit_cr_access(struct vcpu_t *vcpu, struct hax_tunnel *htun)
                 cr4_pae_triggers = CR4_PAE | CR4_PGE | CR4_PSE;
                 if ((val & CR4_PAE) && (state->_cr0 & CR0_PG) &&
                     !(state->_efer & IA32_EFER_LME) && !vtlb_active(vcpu) &&
-                    ((val ^ cr_ptr) & cr4_pae_triggers)) {
-                    hax_info("%s: vCPU #%u triggers PDPT (re)load for EPT+PAE"
-                             " mode (CR4 path)\n", __func__, vcpu->vcpu_id);
+                    ((val ^ old_val) & cr4_pae_triggers)) {
+                    hax_log(HAX_LOGI, "%s: vCPU #%u triggers PDPT (re)load for "
+                            "EPT+PAE mode (CR4 path)\n", __func__,
+                            vcpu->vcpu_id);
                     is_ept_pae = true;
                 }
-            }
-
-            if (cr == 8) {
-                hax_error("Unsupported CR%d access\n", cr);
+            } else {
+                hax_log(HAX_LOGE, "Unsupported CR%d write, val=0x%llx\n",
+                        cr, val);
                 break;
             }
-            check_flush(vcpu, cr_ptr ^ val);
+            check_flush(vcpu, old_val ^ val);
             vcpu_write_cr(state, cr, val);
 
             if (is_ept_pae) {
@@ -3160,18 +2906,18 @@ static int exit_cr_access(struct vcpu_t *vcpu, struct hax_tunnel *htun)
                 // registers
                 int ret = vcpu_prepare_pae_pdpt(vcpu);
                 if (ret) {
-                    hax_panic_vcpu(vcpu, "vCPU #%u failed to (re)load PDPT for"
-                                   " EPT+PAE mode: ret=%d\n",
-                                   vcpu->vcpu_id, ret);
+                    vcpu_set_panic(vcpu);
+                    hax_log(HAX_LOGPANIC, "vCPU #%u failed to (re)load PDPT for"
+                            " EPT+PAE mode: ret=%d\n", vcpu->vcpu_id, ret);
                     dump_vmcs(vcpu);
                     return HAX_RESUME;
                 }
             }
 
             if ((vmcs_err = load_vmcs(vcpu, &flags))) {
-                hax_panic_vcpu(vcpu,
-                               "load_vmcs failed while exit_cr_access %x\n",
-                               vmcs_err);
+                vcpu_set_panic(vcpu);
+                hax_log(HAX_LOGPANIC,
+                        "load_vmcs failed while exit_cr_access %x\n", vmcs_err);
                 hax_panic_log(vcpu);
                 return HAX_RESUME;
             }
@@ -3179,64 +2925,65 @@ static int exit_cr_access(struct vcpu_t *vcpu, struct hax_tunnel *htun)
             vmwrite_cr(vcpu);
 
             if ((vmcs_err = put_vmcs(vcpu, &flags))) {
-                hax_panic_vcpu(vcpu,
-                               "put_vmcs failed while exit_cr_access %x\n",
-                               vmcs_err);
+                vcpu_set_panic(vcpu);
+                hax_log(HAX_LOGPANIC,
+                        "put_vmcs failed while exit_cr_access %x\n", vmcs_err);
                 hax_panic_log(vcpu);
             }
 
             break;
         }
         case 1: { // MOV CR -> GPR
-            hax_info("cr_access R CR%d\n", cr);
+            uint64_t val;
 
-            state->_regs[vmx(vcpu, exit_qualification).cr.gpr] = cr_ptr;
-            if (cr == 8) {
-                hax_info("Unsupported CR%d access\n", cr);
-                break;
-            }
+            hax_log(HAX_LOGI, "cr_access R CR%d\n", cr);
+
+            val = vcpu_read_cr(state, cr);
+            // TODO: Redirect CR8 read to user space (emulated APIC.TPR)
+            state->_regs[vmx(vcpu, exit_qualification).cr.gpr] = val;
             break;
         }
         case 2: { // CLTS
-            hax_info("CLTS\n");
-            state->_cr0 &= ~(uint64)CR0_TS;
-            if (!vcpu->is_fpu_used) {
-                vcpu->is_fpu_used = 1;
-            }
+            hax_log(HAX_LOGI, "CLTS\n");
+            state->_cr0 &= ~(uint64_t)CR0_TS;
             if ((vmcs_err = load_vmcs(vcpu, &flags))) {
-                hax_panic_vcpu(vcpu, "load_vmcs failed while CLTS: %x\n",
-                               vmcs_err);
+                vcpu_set_panic(vcpu);
+                hax_log(HAX_LOGPANIC, "load_vmcs failed while CLTS: %x\n",
+                        vmcs_err);
                 hax_panic_log(vcpu);
                 return HAX_RESUME;
             }
             vmwrite_cr(vcpu);
             if ((vmcs_err = put_vmcs(vcpu, &flags))) {
-                hax_panic_vcpu(vcpu, "put_vmcs failed while CLTS: %x\n",
-                               vmcs_err);
+                vcpu_set_panic(vcpu);
+                hax_log(HAX_LOGPANIC, "put_vmcs failed while CLTS: %x\n",
+                        vmcs_err);
                 hax_panic_log(vcpu);
             }
             break;
         }
         case 3: { // LMSW
-            hax_info("LMSW\n");
+            hax_log(HAX_LOGI, "LMSW\n");
             state->_cr0 = (state->_cr0 & ~0xfULL) |
                           (vmx(vcpu, exit_qualification).cr.lmsw_source & 0xf);
             if ((vmcs_err = load_vmcs(vcpu, &flags))) {
-                hax_panic_vcpu(vcpu, "load_vmcs failed while LMSW %x\n",
-                               vmcs_err);
+                vcpu_set_panic(vcpu);
+                hax_log(HAX_LOGPANIC, "load_vmcs failed while LMSW %x\n",
+                        vmcs_err);
                 hax_panic_log(vcpu);
                 return HAX_RESUME;
             }
             vmwrite_cr(vcpu);
             if ((vmcs_err = put_vmcs(vcpu, &flags))) {
-                hax_panic_vcpu(vcpu, "put_vmcs failed while LMSW %x\n",
-                               vmcs_err);
+                vcpu_set_panic(vcpu);
+                hax_log(HAX_LOGPANIC, "put_vmcs failed while LMSW %x\n",
+                        vmcs_err);
                 hax_panic_log(vcpu);
             }
             break;
         }
         default: {
-            hax_error("Unsupported Control Register access type.\n");
+            hax_log(HAX_LOGE, "Unsupported Control Register access type.\n");
             break;
         }
     }
@@ -3247,22 +2994,25 @@ static int exit_cr_access(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 
 static int exit_dr_access(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 {
-    uint64 *dr;
+    uint64_t *dr = NULL;
+    int dreg = vmx(vcpu, exit_qualification.dr.dreg);
+    int gpr_reg = vmx(vcpu, exit_qualification).dr.gpr;
+    bool hbreak_enabled = !!(vcpu->debug_control & HAX_DEBUG_USE_HW_BP);
     struct vcpu_state_t *state = vcpu->state;
 
     htun->_exit_reason = vmx(vcpu, exit_reason).basic_reason;
 
-    // Generally detect
+    // General Detect(GD) Enable flag
     if (state->_dr7 & DR7_GD) {
-        state->_dr7 &= ~(uint64)DR7_GD;
+        state->_dr7 &= ~(uint64_t)DR7_GD;
         state->_dr6 |= DR6_BD;
         vmwrite(vcpu, GUEST_DR7, state->_dr7);
         // Priority 4 fault
-        hax_inject_exception(vcpu, EXC_DEBUG, NO_ERROR_CODE);
+        hax_inject_exception(vcpu, VECTOR_DB, NO_ERROR_CODE);
         return HAX_RESUME;
     }
 
-    switch (vmx(vcpu, exit_qualification.dr.dreg)) {
+    switch (dreg) {
         case 0: {
             dr = &state->_dr0;
             break;
@@ -3281,34 +3031,58 @@ static int exit_dr_access(struct vcpu_t *vcpu, struct hax_tunnel *htun)
         }
         case 4: {
             if (state->_cr4 & CR4_DE) {
-                hax_inject_exception(vcpu, EXC_UNDEFINED_OPCODE, NO_ERROR_CODE);
+                hax_inject_exception(vcpu, VECTOR_UD, NO_ERROR_CODE);
                 return HAX_RESUME;
             }
-            // Fall through
-        }
-        case 6: {
             dr = &state->_dr6;
             break;
         }
         case 5: {
             if (state->_cr4 & CR4_DE) {
-                hax_inject_exception(vcpu, EXC_UNDEFINED_OPCODE, NO_ERROR_CODE);
+                hax_inject_exception(vcpu, VECTOR_UD, NO_ERROR_CODE);
                 return HAX_RESUME;
             }
-            // Fall through
-        }
-        default: {
             dr = &state->_dr7;
             break;
+        }
+        case 6: {
+            dr = &state->_dr6;
+            break;
+        }
+        case 7: {
+            dr = &state->_dr7;
+            break;
+        }
+        default: {
+            // It should not go here. Unreachable.
         }
     }
 
     if (vmx(vcpu, exit_qualification.dr.direction)) {
         // MOV DR -> GPR
-        state->_regs[vmx(vcpu, exit_qualification).dr.gpr] = *dr;
+        if (hbreak_enabled) {
+            // HAX hardware breakpoint enabled, return dr default value
+            if (dreg == 6)
+                state->_regs[gpr_reg] = DR6_SETBITS;
+            else if (dreg == 7)
+                state->_regs[gpr_reg] = DR7_SETBITS;
+            else
+                state->_regs[gpr_reg] = 0;
+
+            hax_log(HAX_LOGD, "Ignore guest DR%d read due to hw bp enabled.\n",
+                    dreg);
+        } else {
+            state->_regs[gpr_reg] = *dr;
+        }
     } else {
         // MOV DR <- GPR
-        *dr = state->_regs[vmx(vcpu, exit_qualification).dr.gpr];
+        if (hbreak_enabled) {
+            hax_log(HAX_LOGD, "Ignore guest DR%d write due to hw bp enabled.\n",
+                    dreg);
+        } else {
+            *dr = state->_regs[gpr_reg];
+            vcpu->dr_dirty = 1;
+        }
     }
 
     advance_rip(vcpu);
@@ -3319,73 +3093,71 @@ static int handle_string_io(struct vcpu_t *vcpu, exit_qualification_t *qual,
                             struct hax_tunnel *htun)
 {
     struct vcpu_state_t *state = vcpu->state;
-    uint real_size, count, required_size;
-    vaddr_t start, rindex;
+    uint64_t count, total_size;
+    uint elem_size, n, copy_size;
+    hax_vaddr_t gla, start_gva;
 
+    // 1 indicates string I/O (i.e. OUTS or INS)
     htun->io._flags = 1;
 
     count = qual->io.rep ? state->_rcx : 1;
-    required_size = count * htun->io._size;
+    elem_size = htun->io._size;
+    total_size = count * elem_size;
 
-    if (required_size <= IOS_MAX_BUFFER) {
-        real_size = count * htun->io._size;
-        htun->io._count = count;
-    } else {
-        real_size = IOS_MAX_BUFFER;
-        htun->io._count = IOS_MAX_BUFFER / htun->io._size;
-    }
+    // Number of data elements to copy
+    n = total_size > IOS_MAX_BUFFER ? IOS_MAX_BUFFER / elem_size : (uint)count;
+    htun->io._count = n;
+    copy_size = n * elem_size;
 
-    rindex = qual->io.direction == HAX_IO_OUT ? state->_rsi : state->_rdi;
-
+    // Both OUTS and INS instructions reference a GVA, which indicates the
+    // source (for OUTS) or destination (for INS) of data transfer. This GVA is
+    // conveniently recorded in VMCS by hardware at VM exit time (see IA SDM
+    // Vol. 3C 27.2.1, "Guest-linear address"), so there is no need to fetch the
+    // instruction and parse it manually (e.g. to determine the address-size
+    // attribute of the instruction, or to check the presence of a segment
+    // override prefix that can make OUTS read from ES:ESI instead of DS:ESI).
+    gla = vmread(vcpu, VM_EXIT_INFO_GUEST_LINEAR_ADDRESS);
     if (state->_rflags & EFLAGS_DF) {
-        start = rindex - real_size + htun->io._size;
+        start_gva = gla - (n - 1) * elem_size;
         htun->io._df = 1;
     } else {
-        start = rindex;
+        start_gva = gla;
         htun->io._df = 0;
     }
-
-    htun->io._vaddr = start;
-
-    // For UG platform and real mode
-    if (hax->ug_enable_flag && !(vcpu->state->_cr0 & CR0_PE)) {
-        if (qual->io.direction == HAX_IO_OUT) {
-            htun->io._vaddr += state->_ds.selector * 16;
-        } else {
-            htun->io._vaddr += state->_es.selector * 16;
-        }
-        start = htun->io._vaddr;
-    }
+    // For INS (see handle_io_post())
+    htun->io._vaddr = start_gva;
 
     if (qual->io.direction == HAX_IO_OUT) {
-        if (!vcpu_read_guest_virtual(vcpu, start, vcpu->io_buf, IOS_MAX_BUFFER,
-                                     real_size, 0))
+        if (!vcpu_read_guest_virtual(vcpu, start_gva, vcpu->io_buf,
+                                     IOS_MAX_BUFFER, copy_size, 0)) {
+            vcpu_set_panic(vcpu);
+            hax_log(HAX_LOGPANIC, "%s: vcpu_read_guest_virtual() failed,"
+                    " start_gva=0x%llx, elem_size=%u, count=%llu\n",
+                    __func__, start_gva, elem_size, count);
+            dump_vmcs(vcpu);
             return HAX_RESUME;
-    } else {
-        // HACK: Just ensure the buffer is mapped in the kernel.
-        if (!vcpu_write_guest_virtual(vcpu, start, IOS_MAX_BUFFER, vcpu->io_buf,
-                                      real_size, 0))
-            return HAX_RESUME;
+        }
     }
 
-    if (required_size <= IOS_MAX_BUFFER) {
-        state->_rcx = 0;
+    state->_rcx -= n;
+    if (n == count) {
         advance_rip(vcpu);
-    } else {
-        state->_rcx -= IOS_MAX_BUFFER / htun->io._size;
     }
 
     if (state->_rflags & EFLAGS_DF) {
-        rindex -= real_size ;
+        if (qual->io.direction == HAX_IO_OUT) {
+            state->_rsi -= copy_size;
+        } else {
+            state->_rdi -= copy_size;
+        }
     } else {
-        rindex += real_size;
+        if (qual->io.direction == HAX_IO_OUT) {
+            state->_rsi += copy_size;
+        } else {
+            state->_rdi += copy_size;
+        }
     }
 
-    if (qual->io.direction == HAX_IO_OUT) {
-        state->_rsi = rindex;
-    } else {
-        state->_rdi = rindex;
-    }
     htun->_exit_status = HAX_EXIT_IO;
     return HAX_EXIT;
 }
@@ -3400,15 +3172,15 @@ static int handle_io(struct vcpu_t *vcpu, exit_qualification_t *qual,
     if (qual->io.direction == HAX_IO_OUT) {
         switch (qual->io.size + 1) {
             case 1: {
-                *((uint8 *)vcpu->io_buf) = state->_al;
+                *((uint8_t *)vcpu->io_buf) = state->_al;
                 break;
             }
             case 2: {
-                *((uint16 *)vcpu->io_buf) = state->_ax;
+                *((uint16_t *)vcpu->io_buf) = state->_ax;
                 break;
             }
             case 4: {
-                *((uint32 *)vcpu->io_buf) = state->_eax;
+                *((uint32_t *)vcpu->io_buf) = state->_eax;
                 break;
             }
             default: {
@@ -3439,8 +3211,8 @@ static int exit_io_access(struct vcpu_t *vcpu, struct hax_tunnel *htun)
     htun->io._size = qual->io.size + 1;
     htun->io._direction = qual->io.direction;
 
-    hax_debug("exit_io_access port %x, size %d\n", htun->io._port,
-              htun->io._size);
+    hax_log(HAX_LOGD, "exit_io_access port %x, size %d\n", htun->io._port,
+            htun->io._size);
 
     if (qual->io.string)
         return handle_string_io(vcpu, qual, htun);
@@ -3451,8 +3223,8 @@ static int exit_io_access(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 static int exit_msr_read(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 {
     struct vcpu_state_t *state = vcpu->state;
-    uint32 msr = state->_ecx;
-    uint64 val;
+    uint32_t msr = state->_ecx;
+    uint64_t val;
 
     htun->_exit_reason = vmx(vcpu, exit_reason).basic_reason;
 
@@ -3460,7 +3232,7 @@ static int exit_msr_read(struct vcpu_t *vcpu, struct hax_tunnel *htun)
         state->_rax = val & 0xffffffff;
         state->_rdx = (val >> 32) & 0xffffffff;
     } else {
-        hax_inject_exception(vcpu, EXC_GENERAL_PROTECTION, 0);
+        hax_inject_exception(vcpu, VECTOR_GP, 0);
         return HAX_RESUME;
     }
 
@@ -3471,13 +3243,13 @@ static int exit_msr_read(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 static int exit_msr_write(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 {
     struct vcpu_state_t *state = vcpu->state;
-    uint32 msr = state->_ecx;
-    uint64 val = (uint64)(state->_edx) << 32 | state->_eax;
+    uint32_t msr = state->_ecx;
+    uint64_t val = (uint64_t)(state->_edx) << 32 | state->_eax;
 
     htun->_exit_reason = vmx(vcpu, exit_reason).basic_reason;
 
-    if (handle_msr_write(vcpu, msr, val)) {
-        hax_inject_exception(vcpu, EXC_GENERAL_PROTECTION, 0);
+    if (handle_msr_write(vcpu, msr, val, false)) {
+        hax_inject_exception(vcpu, VECTOR_GP, 0);
         return HAX_RESUME;
     }
 
@@ -3489,12 +3261,12 @@ static int exit_msr_write(struct vcpu_t *vcpu, struct hax_tunnel *htun)
  * Returns 0 if handled, else returns 1
  * According to the caller, return 1 will cause GP to guest
  */
-static int misc_msr_read(struct vcpu_t *vcpu, uint32 msr, uint64 *val)
+static int misc_msr_read(struct vcpu_t *vcpu, uint32_t msr, uint64_t *val)
 {
     mtrr_var_t *v;
 
     if (msr >= IA32_MTRR_PHYSBASE0 && msr <= IA32_MTRR_PHYSMASK9) {
-        assert((msr >> 1 & 0x7f) < NUM_VARIABLE_MTRRS);
+        hax_assert((msr >> 1 & 0x7f) < NUM_VARIABLE_MTRRS);
         v = &vcpu->mtrr_current_state.mtrr_var[msr >> 1 & 0x7f];
         *val = msr & 1 ? v->mask.raw : v->base.raw;
         return 0;
@@ -3513,7 +3285,7 @@ static int misc_msr_read(struct vcpu_t *vcpu, uint32 msr, uint64 *val)
     return 1;
 }
 
-static int handle_msr_read(struct vcpu_t *vcpu, uint32 msr, uint64 *val)
+static int handle_msr_read(struct vcpu_t *vcpu, uint32_t msr, uint64_t *val)
 {
     int index, r = 0;
     struct vcpu_state_t *state = vcpu->state;
@@ -3521,7 +3293,7 @@ static int handle_msr_read(struct vcpu_t *vcpu, uint32 msr, uint64 *val)
 
     switch (msr) {
         case IA32_TSC: {
-            *val = vcpu->tsc_offset + rdtsc();
+            *val = vcpu->tsc_offset + ia32_rdtsc();
             break;
         }
         case IA32_FEATURE_CONTROL: {
@@ -3533,15 +3305,11 @@ static int handle_msr_read(struct vcpu_t *vcpu, uint32 msr, uint64 *val)
             break;
         }
         case IA32_APIC_BASE: {
-            *val = default_mem_addr;
+            *val = gstate->apic_base;
             break;
         }
         case IA32_EFER: {
-            if (!(state->_cr4 & CR4_PAE) && (state->_cr0 & CR0_PG)) {
-                r = 1;
-            } else {
-                *val = state->_efer;
-            }
+            *val = state->_efer;
             break;
         }
         case IA32_STAR:
@@ -3550,7 +3318,7 @@ static int handle_msr_read(struct vcpu_t *vcpu, uint32 msr, uint64 *val)
         case IA32_SF_MASK:
         case IA32_KERNEL_GS_BASE: {
             for (index = 0; index < NR_GMSR; index++) {
-                if ((uint32)gstate->gmsr[index].entry == msr) {
+                if ((uint32_t)gstate->gmsr[index].entry == msr) {
                     *val = gstate->gmsr[index].value;
                     break;
                 }
@@ -3558,8 +3326,19 @@ static int handle_msr_read(struct vcpu_t *vcpu, uint32 msr, uint64 *val)
             }
             break;
         }
+        case IA32_TSC_AUX: {
+            if (!cpu_has_feature(X86_FEATURE_RDTSCP)) {
+                r = 1;
+                break;
+            }
+            *val = gstate->tsc_aux & 0xFFFFFFFF;
+            break;
+        }
         case IA32_FS_BASE: {
-            *val = vmread(vcpu, GUEST_FS_BASE);
+            if (vcpu->fs_base_dirty)
+                *val = vcpu->state->_fs.base;
+            else
+                *val = vmread(vcpu, GUEST_FS_BASE);
             break;
         }
         case IA32_GS_BASE: {
@@ -3672,7 +3451,7 @@ static int handle_msr_read(struct vcpu_t *vcpu, uint32 msr, uint64 *val)
         // the vCPU supports the "pdcm" feature (which it does not)
         case IA32_PERF_CAPABILITIES: {
             *val = 0;
-            hax_info("handle_msr_read: IA32_PERF_CAPABILITIES\n");
+            hax_log(HAX_LOGI, "handle_msr_read: IA32_PERF_CAPABILITIES\n");
             break;
         }
         // In case the host CPU does not support MSR bitmaps, emulate MSR reads
@@ -3683,8 +3462,8 @@ static int handle_msr_read(struct vcpu_t *vcpu, uint32 msr, uint64 *val)
         case IA32_PMC3: {
             *val = hax->apm_version ? gstate->apm_pmc_msrs[msr - IA32_PMC0] &
                    hax->apm_general_mask : 0;
-            hax_info("handle_msr_read: IA32_PMC%u value=0x%llx\n",
-                     msr - IA32_PMC0, *val);
+            hax_log(HAX_LOGI, "handle_msr_read: IA32_PMC%u value=0x%llx\n",
+                    msr - IA32_PMC0, *val);
             break;
         }
         case IA32_PERFEVTSEL0:
@@ -3694,8 +3473,8 @@ static int handle_msr_read(struct vcpu_t *vcpu, uint32 msr, uint64 *val)
             *val = hax->apm_version
                    ? gstate->apm_pes_msrs[msr - IA32_PERFEVTSEL0]
                    : 0;
-            hax_info("handle_msr_read: IA32_PERFEVTSEL%u value=0x%llx\n",
-                     msr - IA32_PERFEVTSEL0, *val);
+            hax_log(HAX_LOGI, "handle_msr_read: IA32_PERFEVTSEL%u "
+                    "value=0x%llx\n", msr - IA32_PERFEVTSEL0, *val);
             break;
         }
         default: {
@@ -3721,7 +3500,7 @@ static void vmwrite_efer(struct vcpu_t *vcpu)
     }
 
     if (vmx(vcpu, entry_ctls) & ENTRY_CONTROL_LOAD_EFER) {
-        uint32 guest_efer = state->_efer;
+        uint32_t guest_efer = state->_efer;
 
         if (vtlb_active(vcpu)) {
             guest_efer |= IA32_EFER_XD;
@@ -3731,12 +3510,12 @@ static void vmwrite_efer(struct vcpu_t *vcpu)
     }
 }
 
-static int misc_msr_write(struct vcpu_t *vcpu, uint32 msr, uint64 val)
+static int misc_msr_write(struct vcpu_t *vcpu, uint32_t msr, uint64_t val)
 {
     mtrr_var_t *v;
 
     if (msr >= IA32_MTRR_PHYSBASE0 && msr <= IA32_MTRR_PHYSMASK9) {
-        assert((msr >> 1 & 0x7f) < NUM_VARIABLE_MTRRS);
+        hax_assert((msr >> 1 & 0x7f) < NUM_VARIABLE_MTRRS);
         v = &vcpu->mtrr_current_state.mtrr_var[msr >> 1 & 0x7f];
         if (msr & 1) {
             v->mask.raw = val;
@@ -3758,7 +3537,8 @@ static int misc_msr_write(struct vcpu_t *vcpu, uint32 msr, uint64 val)
     return 1;
 }
 
-static int handle_msr_write(struct vcpu_t *vcpu, uint32 msr, uint64 val)
+static int handle_msr_write(struct vcpu_t *vcpu, uint32_t msr, uint64_t val,
+                            bool by_host)
 {
     int index, r = 0;
     struct vcpu_state_t *state = vcpu->state;
@@ -3766,7 +3546,7 @@ static int handle_msr_write(struct vcpu_t *vcpu, uint32 msr, uint64 val)
 
     switch (msr) {
         case IA32_TSC: {
-            vcpu->tsc_offset = val - rdtsc();
+            vcpu->tsc_offset = val - ia32_rdtsc();
             if (vmx(vcpu, pcpu_ctls) & USE_TSC_OFFSETTING) {
                 vmwrite(vcpu, VMX_TSC_OFFSET, vcpu->tsc_offset);
             }
@@ -3787,21 +3567,67 @@ static int handle_msr_write(struct vcpu_t *vcpu, uint32 msr, uint64 val)
             break;
         }
         case IA32_EFER: {
-            hax_info("Guest writing to EFER[%u]: 0x%x -> 0x%llx, _cr0=0x%llx,"
-                     " _cr4=0x%llx\n", vcpu->vcpu_id, state->_efer, val,
-                     state->_cr0, state->_cr4);
-            if ((state->_cr0 & CR0_PG) && !(state->_cr4 & CR4_PAE)) {
-                state->_efer = 0;
-            } else {
-                state->_efer = val;
+            hax_log(HAX_LOGI, "%s writing to EFER[%u]: 0x%x -> 0x%llx, "
+                    "_cr0=0x%llx, _cr4=0x%llx\n", by_host ? "Host" : "Guest",
+                    vcpu->vcpu_id, state->_efer, val,
+                    state->_cr0, state->_cr4);
+
+            /* val - "new" EFER, state->_efer - "old" EFER.*/
+            if ((val &
+                 ~((uint64_t)(IA32_EFER_SCE | IA32_EFER_LME |
+                              IA32_EFER_LMA | IA32_EFER_XD)))) {
+                hax_log(HAX_LOGE, "Illegal value 0x%llx written to EFER. "
+                        "Reserved bits were set. EFER was 0x%llx\n",
+                        val, (uint64_t) state->_efer);
+                r = 1;
+                break;
             }
+
+            if (!by_host) {
+                /*
+                 * Two code paths can lead to handle_msr_write():
+                 *  a) The guest invokes the WRMSR instruction;
+                 *  b) The host calls the HAX_VCPU_IOCTL_SET_MSRS ioctl.
+                 * The following checks are only applicable to guest-initiated
+                 * EFER writes, not to host-initiated EFER writes. E.g., when
+                 * booting the guest from a VM snapshot, the host (QEMU) may
+                 * need to initialize the vCPU in 64-bit mode (CR0.PG = CR4.PAE
+                 * = EFER.LME = EFER.LMA = CS.L = 1) via SET_REGS and SET_MSRS
+                 * ioctls.
+                 */
+                if (((val & IA32_EFER_LMA) ^
+                     (state->_efer & IA32_EFER_LMA))) {
+                    hax_log(HAX_LOGW, "Ignoring guest write to IA32_EFER.LMA. "
+                            "EFER: 0x%llx -> 0x%llx\n",
+                            (uint64_t) state->_efer,val);
+                    /*
+                     * No need to explicitly fix the LMA bit here:
+                     *  val ^= IA32_EFER_LMA;
+                     * because in the end vmwrite_efer() will ignore the LMA
+                     * bit in |val|.
+                     */
+                }
+                if ((state->_cr0 & CR0_PG) &&
+                    ((val & IA32_EFER_LME) ^
+                     (state->_efer & IA32_EFER_LME))) {
+                    hax_log(HAX_LOGE, "Attempted to enable or disable Long Mode"
+                            " with paging enabled. EFER: 0x%llx -> 0x%llx\n",
+                            (uint64_t) state->_efer, val);
+                    r = 1;
+                    break;
+                }
+            }
+            state->_efer = val;
+
             if (!(ia32_rdmsr(IA32_EFER) & IA32_EFER_LMA) &&
                 (state->_efer & IA32_EFER_LME)) {
-                hax_panic_vcpu(
-                        vcpu, "64-bit guest is not allowed on 32-bit host.\n");
+                vcpu_set_panic(vcpu);
+                hax_log(HAX_LOGPANIC,
+                        "64-bit guest is not allowed on 32-bit host.\n");
             } else if ((state->_efer & IA32_EFER_LME) && vtlb_active(vcpu)) {
-                hax_panic_vcpu(vcpu, "64-bit guest is not allowed on core 2 "
-                               "machine.\n");
+                vcpu_set_panic(vcpu);
+                hax_log(HAX_LOGPANIC, "64-bit guest is not allowed on core 2 "
+                        "machine.\n");
             } else {
                 vmwrite_efer(vcpu);
             }
@@ -3813,7 +3639,7 @@ static int handle_msr_write(struct vcpu_t *vcpu, uint32 msr, uint64 val)
         case IA32_SF_MASK:
         case IA32_KERNEL_GS_BASE: {
             for (index = 0; index < NR_GMSR; index++) {
-                if ((uint32)gmsr_list[index] == msr) {
+                if ((uint32_t)gmsr_list[index] == msr) {
                     gstate->gmsr[index].value = val;
                     gstate->gmsr[index].entry = msr;
                     break;
@@ -3821,8 +3647,23 @@ static int handle_msr_write(struct vcpu_t *vcpu, uint32 msr, uint64 val)
             }
             break;
         }
+        case IA32_TSC_AUX: {
+            if (!cpu_has_feature(X86_FEATURE_RDTSCP) || (val >> 32)) {
+                r = 1;
+                break;
+            }
+            gstate->tsc_aux = val;
+            break;
+        }
         case IA32_FS_BASE: {
-            vmwrite(vcpu, GUEST_FS_BASE, val);
+            /*
+             * During Android emulator running, there are a lot of FS_BASE
+             * msr write. To avoid unnecessary vmcs loading/putting, don't
+             * write it to vmcs until right before next VM entry, when the
+             * VMCS region has been loaded into memory.
+             */
+            vcpu->state->_fs.base = val;
+            vcpu->fs_base_dirty = 1;
             break;
         }
         case IA32_GS_BASE: {
@@ -3862,9 +3703,7 @@ static int handle_msr_write(struct vcpu_t *vcpu, uint32 msr, uint64 val)
             break;
         }
         case IA32_APIC_BASE: {
-            if ((val & 0xfffff000) != default_mem_addr) {
-                hax_debug("Attempt to set APIC base to %llx.\n", val);
-            }
+            r = vcpu_set_apic_base(vcpu, val);
             break;
         }
         case IA32_BIOS_UPDT_TRIG: {
@@ -3885,8 +3724,8 @@ static int handle_msr_write(struct vcpu_t *vcpu, uint32 msr, uint64 val)
                 // According to IA SDM Vol. 3B 18.2.5, writes to IA_PMCx use
                 // only bits 31..0 of the input value
                 gstate->apm_pmc_msrs[msr - IA32_PMC0] = val & 0xffffffff;
-                hax_info("handle_msr_write: IA32_PMC%u value=0x%llx\n",
-                         msr - IA32_PMC0, val);
+                hax_log(HAX_LOGI, "handle_msr_write: IA32_PMC%u value=0x%llx\n",
+                        msr - IA32_PMC0, val);
             }
             break;
         }
@@ -3898,8 +3737,8 @@ static int handle_msr_write(struct vcpu_t *vcpu, uint32 msr, uint64 val)
                 // According to IA SDM Vol. 3B Figure 18-1 (APM v1) and Figure
                 // 18-6 (APM v3), bits 63..32 of IA_PERFEVTSELx are reserved
                 gstate->apm_pes_msrs[msr - IA32_PERFEVTSEL0] = val & 0xffffffff;
-                hax_info("handle_msr_write: IA32_PERFEVTSEL%u value=0x%llx\n",
-                         msr - IA32_PERFEVTSEL0, val);
+                hax_log(HAX_LOGI, "handle_msr_write: IA32_PERFEVTSEL%u "
+                        "value=0x%llx\n", msr - IA32_PERFEVTSEL0, val);
             }
             break;
         }
@@ -3914,7 +3753,8 @@ static int handle_msr_write(struct vcpu_t *vcpu, uint32 msr, uint64 val)
 static int exit_invalid_guest_state(struct vcpu_t *vcpu,
                                     struct hax_tunnel *htun)
 {
-    hax_panic_vcpu(vcpu, "vcpu->tr:%x\n", vcpu->state->_tr.ar);
+    vcpu_set_panic(vcpu);
+    hax_log(HAX_LOGPANIC, "vcpu->tr:%x\n", vcpu->state->_tr.ar);
     dump_vmcs(vcpu);
     return HAX_RESUME;
 }
@@ -3922,14 +3762,14 @@ static int exit_invalid_guest_state(struct vcpu_t *vcpu,
 static int exit_ept_misconfiguration(struct vcpu_t *vcpu,
                                      struct hax_tunnel *htun)
 {
-    paddr_t gpa;
+    hax_paddr_t gpa;
 #ifdef CONFIG_HAX_EPT2
     int ret;
 #endif  // CONFIG_HAX_EPT2
 
     htun->_exit_reason = vmx(vcpu, exit_reason).basic_reason;
 #ifdef CONFIG_HAX_EPT2
-    gpa = vmread(vcpu, VM_EXIT_INFO_GUEST_PHYSICAL_ADDRESS);
+    gpa = vmx(vcpu, exit_gpa);
     ret = ept_handle_misconfiguration(&vcpu->vm->gpa_space, &vcpu->vm->ept_tree,
                                       gpa);
     if (ret > 0) {
@@ -3938,8 +3778,9 @@ static int exit_ept_misconfiguration(struct vcpu_t *vcpu,
     }
 #endif  // CONFIG_HAX_EPT2
 
-    hax_panic_vcpu(vcpu, "%s: Unexpected EPT misconfiguration: gpa=0x%llx\n",
-                   __func__, gpa);
+    vcpu_set_panic(vcpu);
+    hax_log(HAX_LOGPANIC, "%s: Unexpected EPT misconfiguration: gpa=0x%llx\n",
+            __func__, gpa);
     dump_vmcs(vcpu);
     return HAX_RESUME;
 }
@@ -3947,24 +3788,37 @@ static int exit_ept_misconfiguration(struct vcpu_t *vcpu,
 static int exit_ept_violation(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 {
     exit_qualification_t *qual = &vmx(vcpu, exit_qualification);
-    paddr_t gpa;
-    struct decode dec;
+    hax_paddr_t gpa;
     int ret = 0;
+#ifdef CONFIG_HAX_EPT2
+    uint64_t fault_gfn;
+#endif
 
     htun->_exit_reason = vmx(vcpu, exit_reason).basic_reason;
 
     if (qual->ept.gla1 == 0 && qual->ept.gla2 == 1) {
-        hax_panic_vcpu(vcpu, "Incorrect EPT seting\n");
+        vcpu_set_panic(vcpu);
+        hax_log(HAX_LOGPANIC, "Incorrect EPT setting\n");
         dump_vmcs(vcpu);
         return HAX_RESUME;
     }
 
-    gpa = vmread(vcpu, VM_EXIT_INFO_GUEST_PHYSICAL_ADDRESS);
-    dec.gpa = gpa;
+    gpa = vmx(vcpu, exit_gpa);
 
 #ifdef CONFIG_HAX_EPT2
     ret = ept_handle_access_violation(&vcpu->vm->gpa_space, &vcpu->vm->ept_tree,
-                                      *qual, gpa);
+                                      *qual, gpa, &fault_gfn);
+    if (ret == -EFAULT) {
+        // Extract bits 5..0 from Exit Qualification. They indicate the type of
+        // the faulting access (HAX_PAGEFAULT_ACC_R/W/X) and the types of access
+        // allowed (HAX_PAGEFAULT_PERM_R/W/X).
+        htun->pagefault.flags = qual->raw & 0x3f;
+        htun->pagefault.gpa = fault_gfn << PG_ORDER_4K;
+        htun->pagefault.reserved1 = 0;
+        htun->pagefault.reserved2 = 0;
+        htun->_exit_status = HAX_EXIT_PAGEFAULT;
+        return HAX_EXIT;
+    }
     if (ret == -EACCES) {
         /*
          * For some reason, during boot-up, Chrome OS guests make hundreds of
@@ -3972,13 +3826,16 @@ static int exit_ept_violation(struct vcpu_t *vcpu, struct hax_tunnel *htun)
          * (read-only) and thus result in EPT violations.
          * TODO: Handle this case properly.
          */
-        hax_warning("%s: Treating unsupported EPT violation cause as MMIO.\n",
-                    __func__);
-        goto mmio_handler;
+        hax_log(HAX_LOGW, "%s: Unexpected EPT violation cause. Skipping "
+                "instruction (len=%u)\n", __func__,
+                vcpu->vmx.exit_instr_length);
+        advance_rip(vcpu);
+        return HAX_EXIT;
     }
     if (ret < 0) {
-        hax_panic_vcpu(vcpu, "%s: ept_handle_access_violation() returned %d.\n",
-                       __func__, ret);
+        vcpu_set_panic(vcpu);
+        hax_log(HAX_LOGPANIC, "%s: ept_handle_access_violation() "
+                "returned %d.\n", __func__, ret);
         dump_vmcs(vcpu);
         return HAX_RESUME;
     }
@@ -3987,39 +3844,23 @@ static int exit_ept_violation(struct vcpu_t *vcpu, struct hax_tunnel *htun)
         return HAX_RESUME;
     }
     // ret == 0: The EPT violation is due to MMIO
-mmio_handler:
 #endif
-
-    ret = vcpu_simple_decode(vcpu, &dec);
-    if (ret < 0) {
-        // vcpu_simple_decode() has called hax_panic_vcpu()
-        return HAX_RESUME;
-    } else if (ret > 0) {
-        // Let the device model do the emulation
-        hax_warning("exit_ept_violation: Setting exit status to "
-                    "HAX_EXIT_MMIO.\n");
-        htun->_exit_status = HAX_EXIT_MMIO;
-        htun->mmio.gla = gpa;
-    } else {
-        if (hax_setup_fastmmio(vcpu, htun, &dec)) {
-            // hax_setup_fastmmio() has called hax_panic_vcpu()
-            return HAX_RESUME;
-        }
-    }
-    return HAX_EXIT;
+    return vcpu_emulate_insn(vcpu);
 }
 
 static void handle_mem_fault(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 {
-    hax_warning("handle_mem_fault: Setting exit status to HAX_EXIT_MMIO.\n");
+    hax_log(HAX_LOGW,
+            "handle_mem_fault: Setting exit status to HAX_EXIT_MMIO.\n");
     htun->_exit_status = HAX_EXIT_MMIO;
 }
 
 static int null_handler(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 {
     htun->_exit_reason = vmx(vcpu, exit_reason).basic_reason;
-    hax_panic_vcpu(vcpu, "Unhandled vmx vmexit reason:%d\n",
-                   htun->_exit_reason);
+    vcpu_set_panic(vcpu);
+    hax_log(HAX_LOGPANIC, "Unhandled vmx vmexit reason:%d\n",
+            htun->_exit_reason);
     dump_vmcs(vcpu);
     return HAX_RESUME;
 }
@@ -4104,7 +3945,7 @@ int vcpu_set_regs(struct vcpu_t *vcpu, struct vcpu_state_t *ustate)
     int cr_dirty = 0, dr_dirty = 0;
     preempt_flag flags;
     int rsp_dirty = 0;
-    uint32 vmcs_err = 0;
+    uint32_t vmcs_err = 0;
 
     if (state->_rsp != ustate->_rsp) {
         rsp_dirty = 1;
@@ -4115,19 +3956,20 @@ int vcpu_set_regs(struct vcpu_t *vcpu, struct vcpu_state_t *ustate)
     }
 
     if ((vmcs_err = load_vmcs(vcpu, &flags))) {
-        hax_panic_vcpu(vcpu, "load_vmcs failed on vcpu_set_regs: %x\n",
-                       vmcs_err);
+        vcpu_set_panic(vcpu);
+        hax_log(HAX_LOGPANIC, "load_vmcs failed on vcpu_set_regs: %x\n",
+                vmcs_err);
         hax_panic_log(vcpu);
         return -EFAULT;
     }
 
     if (state->_rip != ustate->_rip) {
         state->_rip = ustate->_rip;
-        vmwrite(vcpu, GUEST_RIP, state->_rip);
+        vcpu->rip_dirty = 1;
     }
     if (state->_rflags != ustate->_rflags) {
         state->_rflags = ustate->_rflags;
-        vmwrite(vcpu, GUEST_RFLAGS, state->_rflags);
+        vcpu->rflags_dirty = 1;
     }
     if (rsp_dirty) {
         state->_rsp = ustate->_rsp;
@@ -4142,12 +3984,53 @@ int vcpu_set_regs(struct vcpu_t *vcpu, struct vcpu_state_t *ustate)
         vmwrite_cr(vcpu);
     }
 
-    UPDATE_VCPU_STATE(_dr0, dr_dirty);
-    UPDATE_VCPU_STATE(_dr1, dr_dirty);
-    UPDATE_VCPU_STATE(_dr2, dr_dirty);
-    UPDATE_VCPU_STATE(_dr3, dr_dirty);
-    UPDATE_VCPU_STATE(_dr6, dr_dirty);
-    UPDATE_VCPU_STATE(_dr7, dr_dirty);
+    /*
+     * When the guest debug feature is in use (HAX_DEBUG_ENABLE is on), guest
+     * DR state is owned by the debugger (QEMU gdbserver), and must be
+     * protected from SET_REGS ioctl (called by other parts of QEMU).
+     *
+     * An obvious case is when hardware breakpoints are enabled
+     * (HAX_DEBUG_ENABLE | HAX_DEBUG_USE_HW_BP): all of DR0..7 need to be
+     * filled with values provided by the debugger. This is actually also true
+     * when hardware breakpoints are disabled: at least, the debugger expects
+     * DR7 to be disabled/reset, so we must not allow SET_REGS to enable it.
+     *
+     * Checking only the HAX_DEBUG_USE_HW_BP flag can actually lead to
+     * incorrect behavior, exposed by the gdb "c[ontinue]" command.
+     *
+     * Usually using hardware breakpoint to debug guest is running in this way:
+     *
+     * 1. QEMU/gdb enables hardware breakpoint via vcpu_debug ioctl;
+     * 2. Guest hits the break point and vm exits;
+     * 3. QEMU/gdb handles the event, then disables HW breakpoint;
+     * 4. QEMU/gdb enables single step debugging then resumes guest;
+     * 5. Guest hits single step and vm exits;
+     * 6. QEMU/gdb re-enable HW breakpoint.
+     * 7. Guest resumes running.
+     *
+     * From step 3 to step 5, HW breakpoint is disabled temporarily and runs
+     * one step, it should be presumably to prevent the guest from looping
+     * on the same HW breakpoint without setting RFAGS.RF (See Intel SDM Vol.
+     * 3B 17.3.1.1), which can't be done in user space.
+     */
+    if (vcpu->debug_control & HAX_DEBUG_ENABLE) {
+        hax_log(HAX_LOGI, "%s: Ignore DR updates because hax debugging has "
+                "been enabled in %d.\n", __func__, vcpu->vcpu_id);
+    } else {
+        UPDATE_VCPU_STATE(_dr0, dr_dirty);
+        UPDATE_VCPU_STATE(_dr1, dr_dirty);
+        UPDATE_VCPU_STATE(_dr2, dr_dirty);
+        UPDATE_VCPU_STATE(_dr3, dr_dirty);
+        ustate->_dr6 = fix_dr6(ustate->_dr6);
+        UPDATE_VCPU_STATE(_dr6, dr_dirty);
+        ustate->_dr7 = fix_dr7(ustate->_dr7);
+        UPDATE_VCPU_STATE(_dr7, dr_dirty);
+
+        if (dr_dirty)
+            vcpu->dr_dirty = 1;
+        else
+            vcpu->dr_dirty = 0;
+    }
 
     UPDATE_SEGMENT_STATE(CS, _cs);
     UPDATE_SEGMENT_STATE(DS, _ds);
@@ -4167,8 +4050,9 @@ int vcpu_set_regs(struct vcpu_t *vcpu, struct vcpu_state_t *ustate)
     }
 
     if ((vmcs_err = put_vmcs(vcpu, &flags))) {
-        hax_panic_vcpu(vcpu, "put_vmcs failed on vcpu_set_regs: %x\n",
-                       vmcs_err);
+        vcpu_set_panic(vcpu);
+        hax_log(HAX_LOGPANIC, "put_vmcs failed on vcpu_set_regs: %x\n",
+                vmcs_err);
         hax_panic_log(vcpu);
     }
 
@@ -4232,17 +4116,52 @@ int vcpu_put_fpu(struct vcpu_t *vcpu, struct fx_layout *ufl)
     return 0;
 }
 
-int vcpu_get_msr(struct vcpu_t *vcpu, uint64 entry, uint64 *val)
+int vcpu_get_msr(struct vcpu_t *vcpu, uint64_t entry, uint64_t *val)
 {
     return handle_msr_read(vcpu, entry, val);
 }
 
-int vcpu_set_msr(struct vcpu_t *vcpu, uint64 entry, uint64 val)
+int vcpu_set_msr(struct vcpu_t *vcpu, uint64_t entry, uint64_t val)
 {
-    return handle_msr_write(vcpu, entry, val);
+    return handle_msr_write(vcpu, entry, val, true);
 }
 
-static void vcpu_dump(struct vcpu_t *vcpu, uint32 mask, const char *caption)
+void vcpu_debug(struct vcpu_t *vcpu, struct hax_debug_t *debug)
+{
+    bool hbreak_enabled = false;
+
+    if (debug->control & HAX_DEBUG_ENABLE) {
+        vcpu->debug_control = debug->control;
+
+        // Hardware breakpoints
+        if (debug->control & HAX_DEBUG_USE_HW_BP) {
+            hbreak_enabled = true;
+        }
+    } else {
+        vcpu->debug_control = 0;
+    }
+
+    if (hbreak_enabled) {
+        vcpu->state->_dr0 = debug->dr[0];
+        vcpu->state->_dr1 = debug->dr[1];
+        vcpu->state->_dr2 = debug->dr[2];
+        vcpu->state->_dr3 = debug->dr[3];
+        vcpu->state->_dr7 = fix_dr7(debug->dr[7]);
+    } else {
+        vcpu->state->_dr0 = 0;
+        vcpu->state->_dr1 = 0;
+        vcpu->state->_dr2 = 0;
+        vcpu->state->_dr3 = 0;
+        vcpu->state->_dr7 = DR7_SETBITS;
+    }
+    vcpu->state->_dr6 = DR6_SETBITS;
+
+    vcpu->debug_control_dirty = 1;
+    vcpu->dr_dirty = 1;
+    vcpu_update_exception_bitmap(vcpu);
+};
+
+static void vcpu_dump(struct vcpu_t *vcpu, uint32_t mask, const char *caption)
 {
     vcpu_vmread_all(vcpu);
     vcpu_state_dump(vcpu);
@@ -4250,7 +4169,7 @@ static void vcpu_dump(struct vcpu_t *vcpu, uint32 mask, const char *caption)
 
 static void vcpu_state_dump(struct vcpu_t *vcpu)
 {
-    hax_debug(
+    hax_log(HAX_LOGD,
             "RIP: %08llx  RSP: %08llx  RFLAGS: %08llx\n"
             "RAX: %08llx  RBX: %08llx  RCX: %08llx  RDX: %08llx\n"
             "RSI: %08llx  RDI: %08llx  RBP: %08llx\n"
@@ -4316,10 +4235,10 @@ static void vcpu_state_dump(struct vcpu_t *vcpu)
             vcpu->state->_gdt.limit,
             vcpu->state->_idt.base,
             vcpu->state->_idt.limit,
-            (uint32)vcpu->state->_efer);
+            (uint32_t)vcpu->state->_efer);
 }
 
-int vcpu_interrupt(struct vcpu_t *vcpu, uint8 vector)
+int vcpu_interrupt(struct vcpu_t *vcpu, uint8_t vector)
 {
     hax_set_pending_intr(vcpu, vector);
     return 1;
@@ -4338,9 +4257,9 @@ int vcpu_pause(struct vcpu_t *vcpu)
         return -1;
 
     vcpu->paused = 1;
-    smp_mb();
+    hax_smp_mb();
     if (vcpu->is_running) {
-        smp_call_function(&cpu_online_map, _vcpu_take_off, NULL);
+        hax_smp_call_function(&cpu_online_map, _vcpu_take_off, NULL);
     }
 
     return 0;
@@ -4349,15 +4268,15 @@ int vcpu_pause(struct vcpu_t *vcpu)
 int vcpu_takeoff(struct vcpu_t *vcpu)
 {
     int cpu_id;
-    cpumap_t targets;
+    hax_cpumap_t targets;
 
     // Don't change the sequence unless you are sure
     if (vcpu->is_running) {
         cpu_id = vcpu->cpu_id;
-        assert(cpu_id != hax_cpuid());
+        hax_assert(cpu_id != hax_cpuid());
         targets = cpu2cpumap(cpu_id);
         // If not considering Windows XP, definitely we don't need this
-        smp_call_function(&targets, _vcpu_take_off, NULL);
+        hax_smp_call_function(&targets, _vcpu_take_off, NULL);
     }
 
     return 0;
@@ -4393,5 +4312,48 @@ int vcpu_event_pending(struct vcpu_t *vcpu)
 
 void vcpu_set_panic(struct vcpu_t *vcpu)
 {
-    vcpu->paniced = 1;
+    vcpu->panicked = 1;
+}
+
+static int vcpu_set_apic_base(struct vcpu_t *vcpu, uint64_t val)
+{
+    struct gstate *gstate = &vcpu->gstate;
+
+    if (val & ~APIC_BASE_MASK) {
+        hax_log(HAX_LOGE, "Try to set reserved bits of IA32_APIC_BASE MSR and"
+                " failed to set APIC base msr to 0x%llx.\n", val);
+        return -EINVAL;
+    }
+
+    if ((val & APIC_BASE_ADDR_MASK) != APIC_BASE_DEFAULT_ADDR) {
+        hax_log(HAX_LOGE, "APIC base cannot be relocated to 0x%llx.\n",
+                val & APIC_BASE_ADDR_MASK);
+        return -EINVAL;
+    }
+
+    if (!(val & APIC_BASE_ENABLE)) {
+        hax_log(HAX_LOGW, "APIC is disabled for vCPU %u.\n", vcpu->vcpu_id);
+    }
+
+    if (val & APIC_BASE_BSP) {
+        if (vcpu_is_bsp(vcpu)) {
+            hax_log(HAX_LOGI, "vCPU %u is set to bootstrap processor.\n",
+                    vcpu->vcpu_id);
+        } else {
+            hax_log(HAX_LOGE, "Bootstrap processor is vCPU %u and cannot "
+                    "changed to vCPU %u.\n", vcpu->vm->bsp_vcpu_id,
+                    vcpu->vcpu_id);
+            return -EINVAL;
+        }
+    }
+
+    gstate->apic_base = val;
+
+    return 0;
+}
+
+static bool vcpu_is_bsp(struct vcpu_t *vcpu)
+{
+    // TODO: add an API to set bootstrap processor
+    return (vcpu->vm->bsp_vcpu_id == vcpu->vcpu_id);
 }

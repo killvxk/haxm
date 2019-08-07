@@ -59,37 +59,33 @@ typedef lck_rw_t hax_rw_lock;
 
 typedef SInt32 hax_atomic_t;
 
-// Signed Types
-typedef signed char         int8;
-typedef signed short        int16;
-typedef signed int          int32;
-typedef signed long long    int64;
-
 // Unsigned Types
-typedef unsigned char       uint8;
-typedef unsigned short      uint16;
-typedef unsigned int        uint32;
-typedef unsigned long long  uint64;
 typedef unsigned long       ulong;
 
-/* return the value before the add */
-static signed int hax_atomic_add(hax_atomic_t *address, SInt32 amount)
+/* Return the value before add */
+static hax_atomic_t hax_atomic_add(hax_atomic_t *address, SInt32 amount)
 {
     return OSAddAtomic(amount, address);
 }
 
-/* return the value before the dec */
-static signed int hax_atomic_dec(hax_atomic_t *address)
+/* Return the value before the increment */
+static hax_atomic_t hax_atomic_inc(hax_atomic_t *address)
+{
+    return OSIncrementAtomic(address);
+}
+
+/* Return the value before the decrement */
+static hax_atomic_t hax_atomic_dec(hax_atomic_t *address)
 {
     return OSDecrementAtomic(address);
 }
 
 /*
  * According to kernel programming, the Atomic function is barrier
- * Although we can write a smp_mb from scrach, this simple one can resolve our
+ * Although we can write a hax_smp_mb from scrach, this simple one can resolve our
  * issue
  */
-static inline void smp_mb(void)
+static inline void hax_smp_mb(void)
 {
     SInt32 atom;
     OSAddAtomic(1, &atom);
@@ -134,15 +130,12 @@ typedef struct hax_kmap_phys {
 }
 #endif
 
-#define PACKED     __attribute__ ((packed))
-#define ALIGNED(x) __attribute__ ((aligned(x)))
-
 typedef ulong mword;
 typedef mword preempt_flag;
-typedef uint64_t cpumap_t;
+typedef uint64_t hax_cpumap_t;
 typedef uint64_t HAX_VADDR_T;
 
-inline cpumap_t cpu2cpumap(int cpu)
+static inline hax_cpumap_t cpu2cpumap(int cpu)
 {
     return (0x1UL << cpu);
 }

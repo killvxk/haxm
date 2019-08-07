@@ -34,9 +34,10 @@
 #include "hax_types.h"
 #include "hax_list.h"
 #include "hax_interface.h"
-#include "asm.h"
 
-extern int hax_page_size;
+// TODO: Refactor proc_event_pending(), and then delete the following forward
+// declaration
+struct vcpu_t;
 
 #define HAX_CUR_VERSION    0x0004
 #define HAX_COMPAT_VERSION 0x0001
@@ -169,7 +170,7 @@ hax_pa_t hax_pa(void *va);
 void *hax_vmap(hax_pa_t pa, uint32_t size);
 static inline void * hax_vmap_pfn(hax_pfn_t pfn)
 {
-    return hax_vmap(pfn << PAGE_SHIFT, PAGE_SIZE);
+    return hax_vmap(pfn << HAX_PAGE_SHIFT, HAX_PAGE_SIZE);
 }
 
 /*
@@ -178,7 +179,7 @@ static inline void * hax_vmap_pfn(hax_pfn_t pfn)
 void hax_vunmap(void *va, uint32_t size);
 static inline void hax_vunmap_pfn(void *va)
 {
-    hax_vunmap((void*)((mword)va & ~PAGE_MASK), PAGE_SIZE);
+    hax_vunmap((void*)((mword)va & ~HAX_PAGE_MASK), HAX_PAGE_SIZE);
 }
 
 struct hax_page;
@@ -204,7 +205,7 @@ void hax_set_page(phax_page page);
 
 static inline uint64_t hax_page2pa(phax_page page)
 {
-    return hax_page2pfn(page) << PAGE_SHIFT;
+    return hax_page2pfn(page) << HAX_PAGE_SHIFT;
 }
 
 #define hax_page_pa hax_page2pa
@@ -214,7 +215,8 @@ void *hax_map_page(struct hax_page *page);
 
 void hax_unmap_page(struct hax_page *page);
 
-int hax_log_level(int level, const char *fmt, ...);
+void hax_log(int level, const char *fmt, ...);
+void hax_panic(const char *fmt, ...);
 
 #ifdef __cplusplus
 }
@@ -229,18 +231,22 @@ static inline unsigned char *hax_page_va(struct hax_page *page)
 #define HAX_MAX_CPUS (sizeof(uint64_t) * 8)
 
 /* Host SMP */
-extern cpumap_t cpu_online_map;
+extern hax_cpumap_t cpu_online_map;
 extern int max_cpus;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-int smp_call_function(cpumap_t *cpus, void(*scfunc)(void *param), void *param);
-extern int cpu_number(void);
+int hax_smp_call_function(hax_cpumap_t *cpus, void(*scfunc)(void *param),
+                          void *param);
 
 uint32_t hax_cpuid(void);
 int proc_event_pending(struct vcpu_t *vcpu);
+
+void hax_disable_preemption(preempt_flag *eflags);
+void hax_enable_preemption(preempt_flag *eflags);
+
 void hax_enable_irq(void);
 void hax_disable_irq(void);
 
@@ -252,17 +258,23 @@ int hax_em64t_enabled(void);
 
 /* Utilities */
 #define HAX_NOLOG       0xff
+#define HAX_LOGPANIC    5
 #define HAX_LOGE        4
 #define HAX_LOGW        3
 #define HAX_LOGI        2
 #define HAX_LOGD        1
 #define HAX_LOG_DEFAULT 3
 
-#ifdef __MACH__
+#ifdef HAX_PLATFORM_DARWIN
 #include "darwin/hax_mac.h"
 #endif
-
-#ifdef __WINNT__
+#ifdef HAX_PLATFORM_LINUX
+#include "linux/hax_linux.h"
+#endif
+#ifdef HAX_PLATFORM_NETBSD
+#include "netbsd/hax_netbsd.h"
+#endif
+#ifdef HAX_PLATFORM_WINDOWS
 #include "windows/hax_windows.h"
 #endif
 

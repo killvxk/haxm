@@ -28,13 +28,220 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "include/ia32.h"
 #include "include/vmx.h"
-#include <string.h>
+
 #include "include/cpu.h"
-#include "include/vcpu.h"
 #include "include/ept.h"
-#include "../include/hax.h"
+#include "include/hax_core_interface.h"
+#include "include/ia32.h"
+#include "include/ia32_defs.h"
+
+static void _vmx_vmwrite(struct vcpu_t *vcpu, const char *name,
+                         component_index_t component,
+                         mword source_val)
+{
+    asm_vmwrite(component, source_val);
+}
+
+static void _vmx_vmwrite_64(struct vcpu_t *vcpu, const char *name,
+                            component_index_t component,
+                            uint64_t source_val)
+{
+#ifdef HAX_ARCH_X86_32
+    asm_vmwrite(component, (uint32_t)source_val);
+    asm_vmwrite(component + 1, (uint32_t)(source_val >> 32));
+#else
+    asm_vmwrite(component, source_val);
+#endif
+}
+
+static void _vmx_vmwrite_natural(struct vcpu_t *vcpu, const char *name,
+                                 component_index_t component,
+                                 uint64_t source_val)
+{
+#ifdef HAX_ARCH_X86_32
+    asm_vmwrite(component, (uint32_t)source_val);
+#else
+    asm_vmwrite(component, source_val);
+#endif
+}
+
+static void __vmx_vmwrite_common(struct vcpu_t *vcpu, const char *name,
+                                 component_index_t component,
+                                 uint64_t source_val)
+{
+    uint8_t val = (component & 0x6000) >> 13;
+    switch (val) {
+        case ENCODE_16:
+        case ENCODE_32: {
+            source_val &= 0x00000000FFFFFFFF;
+            _vmx_vmwrite(vcpu, name, component, source_val);
+            break;
+        }
+        case ENCODE_64: {
+            _vmx_vmwrite_64(vcpu, name, component, source_val);
+            break;
+        }
+        case ENCODE_NATURAL: {
+            _vmx_vmwrite_natural(vcpu, name, component, source_val);
+            break;
+        }
+        default: {
+            hax_log(HAX_LOGE, "Unsupported component %x, val %x\n",
+                    component, val);
+            break;
+        }
+    }
+}
+
+void vmx_vmwrite(struct vcpu_t *vcpu, const char *name,
+                 component_index_t component, uint64_t source_val)
+{
+    preempt_flag flags;
+    uint8_t loaded = 0;
+
+    if (!vcpu || is_vmcs_loaded(vcpu))
+        loaded = 1;
+
+    if (!loaded) {
+        if (load_vmcs(vcpu, &flags)) {
+            vcpu_set_panic(vcpu);
+            hax_log(HAX_LOGPANIC, "%s load_vmcs fail\n", __FUNCTION__);
+            hax_panic_log(vcpu);
+            return;
+        }
+    }
+
+    __vmx_vmwrite_common(vcpu, name, component, source_val);
+
+    if (!loaded) {
+        if (put_vmcs(vcpu, &flags)) {
+            vcpu_set_panic(vcpu);
+            hax_log(HAX_LOGPANIC, "%s put_vmcs fail\n", __FUNCTION__);
+            hax_panic_log(vcpu);
+            return;
+        }
+    }
+}
+
+
+static uint64_t vmx_vmread(struct vcpu_t *vcpu, component_index_t component)
+{
+    uint64_t val = 0;
+
+    val = asm_vmread(component);
+    return val;
+}
+
+static uint64_t vmx_vmread_natural(struct vcpu_t *vcpu,
+                                 component_index_t component)
+{
+    uint64_t val = 0;
+
+    val = asm_vmread(component);
+    return val;
+}
+
+static uint64_t vmx_vmread_64(struct vcpu_t *vcpu, component_index_t component)
+{
+    uint64_t val = 0;
+
+    val = asm_vmread(component);
+#ifdef HAX_ARCH_X86_32
+    val |= ((uint64_t)(asm_vmread(component + 1)) << 32);
+#endif
+    return val;
+}
+
+static uint64_t __vmread_common(struct vcpu_t *vcpu,
+                              component_index_t component)
+{
+    uint64_t value = 0;
+    uint8_t val = (component >> ENCODE_SHIFT) & ENCODE_MASK;
+
+    switch(val) {
+        case ENCODE_16:
+        case ENCODE_32: {
+            value = vmx_vmread(vcpu, component);
+            break;
+        }
+        case ENCODE_64: {
+            value = vmx_vmread_64(vcpu, component);
+            break;
+        }
+        case ENCODE_NATURAL: {
+            value = vmx_vmread_natural(vcpu, component);
+            break;
+        }
+        default: {
+            hax_log(HAX_LOGE, "Unsupported component %x val %x\n",
+                    component, val);
+            break;
+        }
+    }
+    return value;
+}
+
+uint64_t vmread(struct vcpu_t *vcpu, component_index_t component)
+{
+    preempt_flag flags;
+    uint64_t val;
+    uint8_t loaded = 0;
+
+    if (!vcpu || is_vmcs_loaded(vcpu))
+        loaded = 1;
+
+    if (!loaded) {
+        if (load_vmcs(vcpu, &flags)) {
+            vcpu_set_panic(vcpu);
+            hax_log(HAX_LOGPANIC, "%s load_vmcs fail\n", __FUNCTION__);
+            hax_panic_log(vcpu);
+            return 0;
+        }
+    }
+
+    val = __vmread_common(vcpu, component);
+
+    if (!loaded) {
+        if (put_vmcs(vcpu, &flags)) {
+            vcpu_set_panic(vcpu);
+            hax_log(HAX_LOGPANIC, "%s put_vmcs fail\n", __FUNCTION__);
+            hax_panic_log(vcpu);
+            return 0;
+        }
+    }
+
+    return val;
+}
+
+uint64_t vmread_dump(struct vcpu_t *vcpu, unsigned enc, const char *name)
+{
+    uint64_t val;
+
+    switch ((enc >> 13) & 0x3) {
+        case 0:
+        case 2: {
+            val = vmread(vcpu, enc);
+            hax_log(HAX_LOGW, "%04x %s: %llx\n", enc, name, val);
+            break;
+        }
+        case 1: {
+            val = vmread(vcpu, enc);
+            hax_log(HAX_LOGW, "%04x %s: %llx\n", enc, name, val);
+            break;
+        }
+        case 3: {
+            val = vmread(vcpu, enc);
+            hax_log(HAX_LOGW, "%04x %s: %llx\n", enc, name, val);
+            break;
+        }
+        default: {
+            hax_log(HAX_LOGE, "Unsupported enc %x\n", enc);
+            break;
+        }
+    }
+    return val;
+}
 
 void vmx_read_info(info_t *vmxinfo)
 {
@@ -42,7 +249,7 @@ void vmx_read_info(info_t *vmxinfo)
 
     vmxinfo->_basic_info = ia32_rdmsr(IA32_VMX_BASIC);
 
-    if (vmxinfo->_basic_info & ((uint64)1 << 55)) {
+    if (vmxinfo->_basic_info & ((uint64_t)1 << 55)) {
         vmxinfo->pin_ctls   = ia32_rdmsr(IA32_VMX_TRUE_PINBASED_CTLS);
         vmxinfo->pcpu_ctls  = ia32_rdmsr(IA32_VMX_TRUE_PROCBASED_CTLS);
         vmxinfo->exit_ctls  = ia32_rdmsr(IA32_VMX_TRUE_EXIT_CTLS);
@@ -86,7 +293,7 @@ void vmx_read_info(info_t *vmxinfo)
         vmxinfo->_ept_cap = 0;
 }
 
-void get_interruption_info_t(interruption_info_t *info, uint8 v, uint8 t)
+void get_interruption_info_t(interruption_info_t *info, uint8_t v, uint8_t t)
 {
     info->vector = v;
     info->type = t;

@@ -43,62 +43,63 @@
 #include "include/paging.h"
 #include "include/vtlb.h"
 
-static uint64 ept_capabilities;
+static uint64_t ept_capabilities;
 
 #define EPT_BASIC_CAPS  (ept_cap_WB | ept_cap_invept_ac)
 
-bool ept_set_caps(uint64 caps)
+bool ept_set_caps(uint64_t caps)
 {
     if ((caps & EPT_BASIC_CAPS) != EPT_BASIC_CAPS) {
-        hax_warning("Broken host EPT support detected (caps=0x%llx)\n", caps);
+        hax_log(HAX_LOGW, "Broken host EPT support detected (caps=0x%llx)\n",
+                caps);
         return 0;
     }
 
     // ept_cap_invept_ac implies ept_cap_invept
     if (!(caps & ept_cap_invept)) {
-        hax_warning("ept_set_caps: Assuming support for INVEPT (caps=0x%llx)\n",
-                    caps);
+        hax_log(HAX_LOGW, "ept_set_caps: Assuming support for INVEPT "
+                "(caps=0x%llx)\n", caps);
         caps |= ept_cap_invept;
     }
 
     caps &= ~EPT_UNSUPPORTED_FEATURES;
-    ASSERT(!ept_capabilities || caps == ept_capabilities);
+    hax_assert(!ept_capabilities || caps == ept_capabilities);
     // FIXME: This assignment is done by all logical processors simultaneously
     ept_capabilities = caps;
     return 1;
 }
 
-static bool ept_has_cap(uint64 cap)
+static bool ept_has_cap(uint64_t cap)
 {
-    ASSERT(ept_capabilities != 0);
-    // Avoid implicit conversion from uint64 to bool, because the latter may be
-    // typedef'ed as uint8 (see hax_types_windows.h)
+    hax_assert(ept_capabilities != 0);
+    // Avoid implicit conversion from uint64_t to bool, because the latter may be
+    // typedef'ed as uint8_t (see hax_types_windows.h)
     return (ept_capabilities & cap) != 0;
 }
 
 // Get the PDE entry for the specified gpa in EPT
-static epte_t * ept_get_pde(struct hax_ept *ept, paddr_t gpa)
+static epte_t * ept_get_pde(struct hax_ept *ept, hax_paddr_t gpa)
 {
     epte_t *e;
     uint which_g = gpa >> 30;
     // PML4 and PDPTE level needs 2 pages
-    uint64 offset = (2 + which_g) * PAGE_SIZE_4K;
+    uint64_t offset = (2 + which_g) * PAGE_SIZE_4K;
     // Need Xiantao's check
     unsigned char *ept_addr = hax_page_va(ept->ept_root_page);
 
-    assert(which_g < EPT_MAX_MEM_G);
+    hax_assert(which_g < EPT_MAX_MEM_G);
 
     e = (epte_t *)(ept_addr + offset) + ept_get_pde_idx(gpa);
     return e;
 }
 
 // ept_set_pte: caller can use it to setup p2m mapping for the guest.
-bool ept_set_pte(hax_vm_t *hax_vm, paddr_t gpa, paddr_t hpa, uint emt,
+bool ept_set_pte(hax_vm_t *hax_vm, hax_paddr_t gpa, hax_paddr_t hpa, uint emt,
                  uint mem_type, bool *is_modified)
 {
     bool ret = true;
     struct hax_page *page;
-    paddr_t pte_ha;
+    hax_paddr_t pte_ha;
     epte_t *pte;
     void *pte_base, *addr;
     struct hax_ept *ept = hax_vm->ept;
@@ -106,9 +107,10 @@ bool ept_set_pte(hax_vm_t *hax_vm, paddr_t gpa, paddr_t hpa, uint emt,
     uint perm;
     epte_t *pde = ept_get_pde(ept, gpa);
 
-    // hax_debug("hpa %llx gpa %llx\n", hpa, gpa);
+    // hax_log(HAX_LOGD, "hpa %llx gpa %llx\n", hpa, gpa);
     if (which_g >= EPT_MAX_MEM_G) {
-        hax_error("Error: Guest's memory size is beyond %dG!\n", EPT_MAX_MEM_G);
+        hax_log(HAX_LOGE, "Error: Guest's memory size is beyond %dG!\n",
+                EPT_MAX_MEM_G);
         return false;
     }
     hax_mutex_lock(hax_vm->vm_lock);
@@ -141,9 +143,9 @@ bool ept_set_pte(hax_vm_t *hax_vm, paddr_t gpa, paddr_t hpa, uint emt,
     pte = (epte_t *)pte_base + ept_get_pte_idx(gpa);
     // TODO: Just for debugging, need check QEMU for more information
     /* if (epte_is_present(pte)) {
-     *     hax_debug("Can't change the pte entry!\n");
+     *     hax_log(HAX_LOGD, "Can't change the pte entry!\n");
      *     hax_mutex_unlock(hax_vm->vm_lock);
-     *     hax_debug("\npte %llx\n", pte->val);
+     *     hax_log(HAX_LOGD, "\npte %llx\n", pte->val);
      *     hax_vunmap_pfn(pte_base);
      *     return 0;
      * }
@@ -162,7 +164,7 @@ bool ept_set_pte(hax_vm_t *hax_vm, paddr_t gpa, paddr_t hpa, uint emt,
             break;
         }
         default: {
-            hax_error("Unsupported mapping type 0x%x\n", mem_type);
+            hax_log(HAX_LOGE, "Unsupported mapping type 0x%x\n", mem_type);
             ret = false;
             goto out_unmap;
         }
@@ -178,16 +180,16 @@ out_unlock:
     return ret;
 }
 
-static bool ept_lookup(struct vcpu_t *vcpu, paddr_t gpa, paddr_t *hpa)
+static bool ept_lookup(struct vcpu_t *vcpu, hax_paddr_t gpa, hax_paddr_t *hpa)
 {
     epte_t *pde, *pte;
     void *pte_base;
     struct hax_ept *ept = vcpu->vm->ept;
     uint which_g = gpa >> 30;
 
-    ASSERT(ept->ept_root_page);
+    hax_assert(ept->ept_root_page);
     if (which_g >= EPT_MAX_MEM_G) {
-        hax_debug("ept_lookup error!\n");
+        hax_log(HAX_LOGD, "ept_lookup error!\n");
         return 0;
     }
 
@@ -222,13 +224,13 @@ static bool ept_lookup(struct vcpu_t *vcpu, paddr_t gpa, paddr_t *hpa)
  */
 
 // TODO: Do we need to consider cross-page case ??
-bool ept_translate(struct vcpu_t *vcpu, paddr_t gpa, uint order, paddr_t *hpa)
+bool ept_translate(struct vcpu_t *vcpu, hax_paddr_t gpa, uint order, hax_paddr_t *hpa)
 {
-    ASSERT(order == PG_ORDER_4K);
+    hax_assert(order == PG_ORDER_4K);
     return ept_lookup(vcpu, gpa, hpa);
 }
 
-static eptp_t ept_construct_eptp(paddr_t addr)
+static eptp_t ept_construct_eptp(hax_paddr_t addr)
 {
     eptp_t eptp;
     eptp.val = 0;
@@ -241,7 +243,7 @@ static eptp_t ept_construct_eptp(paddr_t addr)
 bool ept_init(hax_vm_t *hax_vm)
 {
     uint i;
-    paddr_t hpa;
+    hax_paddr_t hpa;
     // Need Xiantao's check
     unsigned char *ept_addr;
     epte_t *e;
@@ -249,13 +251,14 @@ bool ept_init(hax_vm_t *hax_vm)
     struct hax_ept *ept;
 
     if (hax_vm->ept) {
-        hax_debug("EPT has been created already!\n");
+        hax_log(HAX_LOGD, "EPT: EPT has been created already!\n");
         return 0;
     }
 
     ept = hax_vmalloc(sizeof(struct hax_ept), 0);
     if (!ept) {
-        hax_debug("EPT: No enough memory for creating EPT structure!\n");
+        hax_log(HAX_LOGD,
+                "EPT: No enough memory for creating EPT structure!\n");
         return 0;
     }
     memset(ept, 0, sizeof(struct hax_ept));
@@ -263,7 +266,7 @@ bool ept_init(hax_vm_t *hax_vm)
 
     page = hax_alloc_pages(EPT_PRE_ALLOC_PG_ORDER, 0, 1);
     if (!page) {
-        hax_debug("EPT: No enough memory for creating ept table!\n");
+        hax_log(HAX_LOGD, "EPT: No enough memory for creating ept table!\n");
         hax_vfree(hax_vm->ept, sizeof(struct hax_ept));
         return 0;
     }
@@ -290,7 +293,7 @@ bool ept_init(hax_vm_t *hax_vm)
 
     hax_init_list_head(&ept->ept_page_list);
 
-    hax_info("ept_init: Calling INVEPT\n");
+    hax_log(HAX_LOGI, "ept_init: Calling INVEPT\n");
     invept(hax_vm, EPT_INVEPT_SINGLE_CONTEXT);
     return 1;
 }
@@ -301,12 +304,12 @@ void ept_free (hax_vm_t *hax_vm)
     struct hax_page *page, *n;
     struct hax_ept *ept = hax_vm->ept;
 
-    ASSERT(ept);
+    hax_assert(ept);
 
     if (!ept->ept_root_page)
         return;
 
-    hax_info("ept_free: Calling INVEPT\n");
+    hax_log(HAX_LOGI, "ept_free: Calling INVEPT\n");
     invept(hax_vm, EPT_INVEPT_SINGLE_CONTEXT);
     hax_list_entry_for_each_safe(page, n, &ept->ept_page_list, struct hax_page,
                                  list) {
@@ -328,38 +331,29 @@ static void invept_smpfunc(struct invept_bundle *bundle)
 {
     struct per_cpu_data *cpu_data;
 
-    smp_mb();
+    hax_smp_mb();
     cpu_data = current_cpu_data();
-    cpu_data->vmxon_err = VMX_SUCCEED;
-    cpu_data->vmxoff_err = VMX_SUCCEED;
-    cpu_data->invept_err = VMX_SUCCEED;
+    cpu_data->invept_res = VMX_SUCCEED;
 
-    cpu_data->host_cr4_vmxe = get_cr4() & CR4_VMXE;
-    set_cr4(get_cr4() | CR4_VMXE);
-    cpu_data->vmxon_err = __vmxon(hax_page_pa(cpu_data->vmxon_page));
+    cpu_vmxroot_enter();
 
-    if (!(cpu_data->vmxon_err & VMX_FAIL_MASK)) {
-        cpu_data->invept_err = __invept(bundle->type, bundle->desc);
-        cpu_data->vmxoff_err = __vmxoff();
-        if (cpu_data->host_cr4_vmxe) {
-            set_cr4(get_cr4() | CR4_VMXE);
-        } else {
-            set_cr4(get_cr4() & ~CR4_VMXE);
-        }
+    if (cpu_data->vmxon_res == VMX_SUCCEED) {
+        cpu_data->invept_res = asm_invept(bundle->type, bundle->desc);
+        cpu_vmxroot_leave();
     }
 }
 
 void invept(hax_vm_t *hax_vm, uint type)
 {
-    uint64 eptp_value = vm_get_eptp(hax_vm);
+    uint64_t eptp_value = vm_get_eptp(hax_vm);
     struct invept_desc desc = { eptp_value, 0 };
     struct invept_bundle bundle;
     int cpu_id;
-    uint32 err;
+    uint32_t res;
 
     if (!ept_has_cap(ept_cap_invept)) {
-        hax_warning("INVEPT was not called due to missing host support"
-                    " (ept_capabilities=0x%llx)\n", ept_capabilities);
+        hax_log(HAX_LOGW, "INVEPT was not called due to missing host support"
+                " (ept_capabilities=0x%llx)\n", ept_capabilities);
         return;
     }
 
@@ -382,11 +376,11 @@ void invept(hax_vm_t *hax_vm, uint type)
 
     bundle.type = type;
     bundle.desc = &desc;
-    smp_call_function(&cpu_online_map, (void (*)(void *))invept_smpfunc,
+    hax_smp_call_function(&cpu_online_map, (void (*)(void *))invept_smpfunc,
                       &bundle);
 
     /*
-     * It is not safe to call hax_error(), etc. from invept_smpfunc(),
+     * It is not safe to call hax_log(), etc. from invept_smpfunc(),
      * especially on macOS; instead, invept_smpfunc() writes VMX instruction
      * results in hax_cpu_data[], which are checked below.
      */
@@ -399,30 +393,30 @@ void invept(hax_vm_t *hax_vm, uint type)
         cpu_data = hax_cpu_data[cpu_id];
         if (!cpu_data) {
             // Should never happen
-            hax_warning("invept: hax_cpu_data[%d] is NULL\n", cpu_id);
+            hax_log(HAX_LOGW, "invept: hax_cpu_data[%d] is NULL\n", cpu_id);
             continue;
         }
 
-        err = (uint32)cpu_data->vmxon_err;
-        if (err & VMX_FAIL_MASK) {
-            hax_error("[Processor #%d] INVEPT was not called, because VMXON"
-                      " failed (err=0x%x)\n", cpu_id, err);
+        res = (uint32_t)cpu_data->vmxon_res;
+        if (res != VMX_SUCCEED) {
+            hax_log(HAX_LOGE, "[Processor #%d] INVEPT was not called, because "
+                    "VMXON failed (err=0x%x)\n", cpu_id, res);
         } else {
-            err = (uint32)cpu_data->invept_err;
-            if (err & VMX_FAIL_MASK) {
-                hax_error("[Processor #%d] INVEPT failed (err=0x%x)\n", cpu_id,
-                          err);
+            res = (uint32_t)cpu_data->invept_res;
+            if (res != VMX_SUCCEED) {
+                hax_log(HAX_LOGE, "[Processor #%d] INVEPT failed (err=0x%x)\n",
+                        cpu_id, res);
             }
-            err = (uint32)cpu_data->vmxoff_err;
-            if (err & VMX_FAIL_MASK) {
-                hax_error("[Processor #%d] INVEPT was called, but VMXOFF failed"
-                          " (err=0x%x)\n", cpu_id, err);
+            res = (uint32_t)cpu_data->vmxoff_res;
+            if (res != VMX_SUCCEED) {
+                hax_log(HAX_LOGE, "[Processor #%d] INVEPT was called, but "
+                        "VMXOFF failed (err=0x%x)\n", cpu_id, res);
             }
         }
     }
 }
 
-uint64 vcpu_get_eptp(struct vcpu_t *vcpu)
+uint64_t vcpu_get_eptp(struct vcpu_t *vcpu)
 {
     struct hax_ept *ept = vcpu->vm->ept;
 

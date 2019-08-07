@@ -39,11 +39,16 @@
 
 #include "hax_types.h"
 
-#ifdef __MACH__
+#ifdef HAX_PLATFORM_DARWIN
 #include "darwin/hax_interface_mac.h"
 #endif
-
-#ifdef __WINNT__
+#ifdef HAX_PLATFORM_LINUX
+#include "linux/hax_interface_linux.h"
+#endif
+#ifdef HAX_PLATFORM_NETBSD
+#include "netbsd/hax_interface_netbsd.h"
+#endif
+#ifdef HAX_PLATFORM_WINDOWS
 #include "windows/hax_interface_windows.h"
 #endif
 
@@ -56,33 +61,33 @@ struct vmx_msr {
 
 /* fx_layout has 3 formats table 3-56, 512bytes */
 struct fx_layout {
-    uint16  fcw;
-    uint16  fsw;
-    uint8   ftw;
-    uint8   res1;
-    uint16  fop;
+    uint16_t  fcw;
+    uint16_t  fsw;
+    uint8_t   ftw;
+    uint8_t   res1;
+    uint16_t  fop;
     union {
         struct {
-            uint32  fip;
-            uint16  fcs;
-            uint16  res2;
+            uint32_t  fip;
+            uint16_t  fcs;
+            uint16_t  res2;
         };
-        uint64  fpu_ip;
+        uint64_t  fpu_ip;
     };
     union {
         struct {
-            uint32  fdp;
-            uint16  fds;
-            uint16  res3;
+            uint32_t  fdp;
+            uint16_t  fds;
+            uint16_t  res3;
         };
-        uint64  fpu_dp;
+        uint64_t  fpu_dp;
     };
-    uint32  mxcsr;
-    uint32  mxcsr_mask;
-    uint8   st_mm[8][16];
-    uint8   mmx_1[8][16];
-    uint8   mmx_2[8][16];
-    uint8   pad[96];
+    uint32_t  mxcsr;
+    uint32_t  mxcsr_mask;
+    uint8_t   st_mm[8][16];
+    uint8_t   mmx_1[8][16];
+    uint8_t   mmx_2[8][16];
+    uint8_t   pad[96];
 } ALIGNED(16);
 
 /*
@@ -123,22 +128,40 @@ struct hax_tunnel {
             uint8_t _pad0;
             uint16_t _pad1;
             uint32_t _pad2;
-            vaddr_t _vaddr;
+            hax_vaddr_t _vaddr;
         } io;
         struct {
-            paddr_t gla;
+            hax_paddr_t gla;
         } mmio;
         struct {
-            paddr_t dummy;
+            hax_paddr_t gpa;
+#define HAX_PAGEFAULT_ACC_R  (1 << 0)
+#define HAX_PAGEFAULT_ACC_W  (1 << 1)
+#define HAX_PAGEFAULT_ACC_X  (1 << 2)
+#define HAX_PAGEFAULT_PERM_R (1 << 4)
+#define HAX_PAGEFAULT_PERM_W (1 << 5)
+#define HAX_PAGEFAULT_PERM_X (1 << 6)
+            uint32_t flags;
+            uint32_t reserved1;
+            uint64_t reserved2;
+        } pagefault;
+        struct {
+            hax_paddr_t dummy;
         } state;
+        struct {
+            uint64_t rip;
+            uint64_t dr6;
+            uint64_t dr7;
+        } debug;
     };
+    uint64_t apic_base;
 } PACKED;
 
 struct hax_fastmmio {
-    paddr_t gpa;
+    hax_paddr_t gpa;
     union {
         uint64_t value;
-        paddr_t gpa2;  /* since API v4 */
+        hax_paddr_t gpa2;  /* since API v4 */
     };
     uint8_t size;
     uint8_t direction;
@@ -155,11 +178,22 @@ struct hax_module_version {
     uint32_t cur_version;
 } PACKED;
 
-#define HAX_CAP_STATUS_WORKING     0x0
-#define HAX_CAP_STATUS_NOTWORKING  0x1
+#define HAX_CAP_STATUS_WORKING     (1 << 0)
+#define HAX_CAP_MEMQUOTA           (1 << 1)
+#define HAX_CAP_WORKSTATUS_MASK    0x01
 
-#define HAX_CAP_FAILREASON_VT      0x1
-#define HAX_CAP_FAILREASON_NX      0x2
+#define HAX_CAP_FAILREASON_VT      (1 << 0)
+#define HAX_CAP_FAILREASON_NX      (1 << 1)
+
+#define HAX_CAP_EPT                (1 << 0)
+#define HAX_CAP_FASTMMIO           (1 << 1)
+#define HAX_CAP_UG                 (1 << 2)
+#define HAX_CAP_64BIT_RAMBLOCK     (1 << 3)
+#define HAX_CAP_64BIT_SETRAM       (1 << 4)
+#define HAX_CAP_TUNNEL_PAGE        (1 << 5)
+#define HAX_CAP_RAM_PROTECTION     (1 << 6)
+#define HAX_CAP_DEBUG              (1 << 7)
+#define HAX_CAP_IMPLICIT_RAMBLOCK  (1 << 8)
 
 struct hax_capabilityinfo {
     /*
@@ -201,8 +235,19 @@ struct hax_alloc_ram_info {
     uint64_t va;
 } PACKED;
 
-#define HAX_RAM_INFO_ROM     0x01  // read-only
-#define HAX_RAM_INFO_INVALID 0x80  // unmapped, usually used for MMIO
+struct hax_ramblock_info {
+    uint64_t start_va;
+    uint64_t size;
+    uint64_t reserved;
+} PACKED;
+
+// Read-only mapping
+#define HAX_RAM_INFO_ROM (1 << 0)
+// Stand-alone mapping into a new HVA range
+#define HAX_RAM_INFO_STANDALONE (1 << 6)
+
+// Unmapped, usually used for MMIO
+#define HAX_RAM_INFO_INVALID (1 << 7)
 
 struct hax_set_ram_info {
     uint64_t pa_start;
@@ -212,12 +257,44 @@ struct hax_set_ram_info {
     uint64_t va;
 } PACKED;
 
+struct hax_set_ram_info2 {
+    uint64_t pa_start;
+    uint64_t size;
+    uint64_t va;
+    uint32_t flags;
+    uint32_t reserved1;
+    uint64_t reserved2;
+} PACKED;
+
+// No access (R/W/X) is allowed
+#define HAX_RAM_PERM_NONE 0x0
+// All accesses (R/W/X) are allowed
+#define HAX_RAM_PERM_RWX  0x7
+#define HAX_RAM_PERM_MASK 0x7
+struct hax_protect_ram_info {
+    uint64_t pa_start;
+    uint64_t size;
+    uint32_t flags;
+    uint32_t reserved;
+} PACKED;
+
 /* This interface is support only after API version 2 */
 struct hax_qemu_version {
     /* Current API version in QEMU*/
     uint32_t cur_version;
     /* The least API version supported by QEMU */
     uint32_t least_version;
+} PACKED;
+
+#define HAX_DEBUG_ENABLE     (1 << 0)
+#define HAX_DEBUG_STEP       (1 << 1)
+#define HAX_DEBUG_USE_SW_BP  (1 << 2)
+#define HAX_DEBUG_USE_HW_BP  (1 << 3)
+
+struct hax_debug_t {
+    uint32_t control;
+    uint32_t reserved;
+    uint64_t dr[8];
 } PACKED;
 
 #endif  // HAX_INTERFACE_H_

@@ -29,6 +29,7 @@
  */
 
 #include "include/intr.h"
+#include "include/ia32_defs.h"
 #include "include/vcpu.h"
 #include "../include/hax.h"
 
@@ -36,10 +37,10 @@
  * Get highest pending interrupt vector
  * return HAX_INVALID_INTR_VECTOR when no pending
  */
-uint32 vcpu_get_pending_intrs(struct vcpu_t *vcpu)
+uint32_t vcpu_get_pending_intrs(struct vcpu_t *vcpu)
 {
-    uint32 offset, vector;
-    uint32 *intr_pending = vcpu->intr_pending;
+    uint32_t offset, vector;
+    uint32_t *intr_pending = vcpu->intr_pending;
     int i;
 
     if (!vcpu->nr_pending_intrs)
@@ -47,7 +48,7 @@ uint32 vcpu_get_pending_intrs(struct vcpu_t *vcpu)
 
     for (i = 7; i >= 0; i--) {
         if (intr_pending[i]) {
-            offset = __fls(intr_pending[i]);
+            offset = asm_fls(intr_pending[i]);
             break;
         }
     }
@@ -55,19 +56,19 @@ uint32 vcpu_get_pending_intrs(struct vcpu_t *vcpu)
     if (i < 0)
         return HAX_INVALID_INTR_VECTOR;
 
-    vector = (uint8) (i * 32 + offset);
+    vector = (uint8_t) (i * 32 + offset);
     return vector;
 }
 
 /* Set pending interrupts from userspace in the bitmap */
-void hax_set_pending_intr(struct vcpu_t *vcpu, uint8 vector)
+void hax_set_pending_intr(struct vcpu_t *vcpu, uint8_t vector)
 {
-    uint32 *intr_pending = vcpu->intr_pending;
-    uint8 offset = vector % 32;
-    uint8 nr_word = vector / 32;
+    uint32_t *intr_pending = vcpu->intr_pending;
+    uint8_t offset = vector % 32;
+    uint8_t nr_word = vector / 32;
 
     if (intr_pending[nr_word] & (1 << offset)) {
-        hax_debug("vector :%d is already pending.", vector);
+        hax_log(HAX_LOGD, "vector :%d is already pending.", vector);
         return;
     }
     intr_pending[nr_word] |= 1 << offset;
@@ -77,13 +78,13 @@ void hax_set_pending_intr(struct vcpu_t *vcpu, uint8 vector)
 /*
  * Clear the pending irqs after injection.
  */
-static void vcpu_ack_intr(struct vcpu_t *vcpu, uint8 vector)
+static void vcpu_ack_intr(struct vcpu_t *vcpu, uint8_t vector)
 {
-    uint32 *intr_pending = vcpu->intr_pending;
-    uint8 offset = vector % 32;
-    uint8 nr_word = vector / 32;
+    uint32_t *intr_pending = vcpu->intr_pending;
+    uint8_t offset = vector % 32;
+    uint8_t nr_word = vector / 32;
 
-    ASSERT(intr_pending[nr_word] & (1 << offset));
+    hax_assert(intr_pending[nr_word] & (1 << offset));
 
     intr_pending[nr_word] &= ~(1 << offset);
     --vcpu->nr_pending_intrs;
@@ -93,9 +94,9 @@ static void vcpu_ack_intr(struct vcpu_t *vcpu, uint8 vector)
 /* Do the real injection operation for virtual external interrrupts
  * caller must ensure the vcpu is ready for accepting the interrupt
  */
-static void hax_inject_intr(struct vcpu_t *vcpu, uint8 vector)
+static void hax_inject_intr(struct vcpu_t *vcpu, uint8_t vector)
 {
-    uint32 intr_info;
+    uint32_t intr_info;
     intr_info = (1 << 31) | vector;
     vmwrite(vcpu, VMX_ENTRY_INTERRUPT_INFO, intr_info);
     vcpu_ack_intr(vcpu, vector);
@@ -119,12 +120,12 @@ static void hax_enable_intr_window(struct vcpu_t *vcpu)
 uint hax_intr_is_blocked(struct vcpu_t *vcpu)
 {
     struct vcpu_state_t *state = vcpu->state;
-    uint32 intr_status;
+    uint32_t intr_status;
 
     if (!(state->_eflags & EFLAGS_IF))
         return 1;
 
-    intr_status = vmread(vcpu, GUEST_INTERRUPTIBILITY);
+    intr_status = vmx(vcpu, interruptibility_state).raw;
     if (intr_status & 3)
         return 1;
     return 0;
@@ -135,20 +136,20 @@ uint hax_intr_is_blocked(struct vcpu_t *vcpu)
  */
 void hax_handle_idt_vectoring(struct vcpu_t *vcpu)
 {
-    uint8 vector;
-    uint32 idt_vec = vmread(vcpu, VM_EXIT_INFO_IDT_VECTORING);
+    uint8_t vector;
+    uint32_t idt_vec = vmread(vcpu, VM_EXIT_INFO_IDT_VECTORING);
 
     if (idt_vec & 0x80000000) {
         if (!(idt_vec & 0x700)) {
             /* One ext interrupt is pending ? Re-inject it ? */
-            vector = (uint8) (idt_vec & 0xff);
+            vector = (uint8_t) (idt_vec & 0xff);
             hax_set_pending_intr(vcpu, vector);
-            hax_debug("extern interrupt is vectoring....vector:%d\n", vector);
+            hax_log(HAX_LOGD, "extern interrupt is vectoring....vector:%d\n",
+                    vector);
         } else {
-            hax_debug("VM Exit @ IDT vectoring, type:%d, vector:%d,"
-                      " error code:%llx\n",
-                      (idt_vec & 0x700) >> 8, idt_vec & 0xff,
-                      vmread(vcpu, VM_EXIT_INFO_IDT_VECTORING_ERROR_CODE));
+            hax_log(HAX_LOGD, "VM Exit @ IDT vectoring, type:%d, vector:%d, "
+                    "error code:%llx\n", (idt_vec & 0x700) >> 8, idt_vec & 0xff,
+                    vmread(vcpu, VM_EXIT_INFO_IDT_VECTORING_ERROR_CODE));
         }
     }
 }
@@ -158,8 +159,8 @@ void hax_handle_idt_vectoring(struct vcpu_t *vcpu)
  */
 void vcpu_inject_intr(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 {
-    uint32 vector;
-    uint32 intr_info;
+    uint32_t vector;
+    uint32_t intr_info;
 
     intr_info = vmread(vcpu, VMX_ENTRY_INTERRUPT_INFO);
     vector = vcpu_get_pending_intrs(vcpu);
@@ -175,15 +176,15 @@ void vcpu_inject_intr(struct vcpu_t *vcpu, struct hax_tunnel *htun)
 /* According the to SDM to check whether the pending vector and injecting vector
  * can generate a double fault.
  */
-static int is_double_fault(uint8 first_vec, uint8 second_vec)
+static int is_double_fault(uint8_t first_vec, uint8_t second_vec)
 {
-    uint32 exc_bitmap1 = 0x7c01u;
-    uint32 exc_bitmap2 = 0x3c01u;
+    uint32_t exc_bitmap1 = 0x7c01u;
+    uint32_t exc_bitmap2 = 0x3c01u;
 
     if (is_extern_interrupt(first_vec))
         return 0;
 
-    if ((first_vec == EXC_PAGEFAULT && (exc_bitmap1 & (1u << second_vec))) ||
+    if ((first_vec == VECTOR_PF && (exc_bitmap1 & (1u << second_vec))) ||
         ((exc_bitmap2 & (1u << first_vec)) && (exc_bitmap2 &
         (1u << second_vec))))
         return 1;
@@ -193,21 +194,21 @@ static int is_double_fault(uint8 first_vec, uint8 second_vec)
 /*
  * Inject faults or exceptions to the virtual processor .
  */
-void hax_inject_exception(struct vcpu_t *vcpu, uint8 vector, uint32 error_code)
+void hax_inject_exception(struct vcpu_t *vcpu, uint8_t vector, uint32_t error_code)
 {
-    uint32 intr_info = 0;
-    uint8 first_vec;
-    uint32 vect_info = vmx(vcpu, exit_idt_vectoring);
-    uint32 exit_instr_length = vmx(vcpu, exit_instr_length);
+    uint32_t intr_info = 0;
+    uint8_t first_vec;
+    uint32_t vect_info = vmx(vcpu, exit_idt_vectoring);
+    uint32_t exit_instr_length = vmx(vcpu, exit_instr_length);
 
     if (vcpu->event_injected == 1)
-        hax_debug("Event is injected already!!:\n");
+        hax_log(HAX_LOGD, "Event is injected already!!:\n");
 
     if (vect_info & INTR_INFO_VALID_MASK) {
-        first_vec = (uint8) (vect_info & INTR_INFO_VECTOR_MASK);
+        first_vec = (uint8_t) (vect_info & INTR_INFO_VECTOR_MASK);
         if (is_double_fault(first_vec, vector)) {
             intr_info = (1 << 31) | (1 << 11) | (EXCEPTION << 8)
-                        | EXC_DOUBLEFAULT;
+                        | VECTOR_DF;
             error_code = 0;
         } else {
             intr_info = (1 << 31) | (EXCEPTION << 8) | vector;
@@ -216,7 +217,7 @@ void hax_inject_exception(struct vcpu_t *vcpu, uint8 vector, uint32 error_code)
         intr_info = (1 << 31) | (EXCEPTION << 8) | vector;
         if (error_code != NO_ERROR_CODE) {
             intr_info |= 1 << 11;
-            if (vector == EXC_PAGEFAULT) {
+            if (vector == VECTOR_PF) {
                 vcpu->vmcs_pending_entry_error_code = 1;
                 vmx(vcpu, entry_exception_error_code) = error_code;
             } else {
@@ -225,7 +226,7 @@ void hax_inject_exception(struct vcpu_t *vcpu, uint8 vector, uint32 error_code)
         }
     }
 
-    if (vector == EXC_PAGEFAULT) {
+    if (vector == VECTOR_PF) {
         vcpu->vmcs_pending_entry_instr_length = 1;
         vmx(vcpu, entry_instr_length) = exit_instr_length;
         vcpu->vmcs_pending_entry_intr_info = 1;
@@ -236,11 +237,11 @@ void hax_inject_exception(struct vcpu_t *vcpu, uint8 vector, uint32 error_code)
         vmwrite(vcpu, VMX_ENTRY_INTERRUPT_INFO, intr_info);
     }
 
-    hax_debug("Guest is injecting exception info:%x\n", intr_info);
+    hax_log(HAX_LOGD, "Guest is injecting exception info:%x\n", intr_info);
     vcpu->event_injected = 1;
 }
 
 void hax_inject_page_fault(struct vcpu_t *vcpu, mword error_code)
 {
-    hax_inject_exception(vcpu, EXC_PAGEFAULT, error_code);
+    hax_inject_exception(vcpu, VECTOR_PF, error_code);
 }

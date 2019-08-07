@@ -39,64 +39,82 @@
 
 typedef struct hax_chunk {
     hax_memdesc_user memdesc;
-    uint64 base_uva;
+    uint64_t base_uva;
     // In bytes, page-aligned, == HAX_CHUNK_SIZE in most cases
-    uint64 size;
+    uint64_t size;
 } hax_chunk;
 
 typedef struct hax_ramblock {
-    uint64 base_uva;
+    uint64_t base_uva;
     // In bytes, page-aligned
-    uint64 size;
+    uint64_t size;
     // hax_chunk *chunks[(size + HAX_CHUNK_SIZE - 1) / HAX_CHUNK_SIZE]
     hax_chunk **chunks;
     // One bit per chunk indicating whether the chunk has been (or is being)
     // allocated/pinned or not
-    uint8 *chunks_bitmap;
+    uint8_t *chunks_bitmap;
+    // Reference count of this object
+    int ref_count;
+    // Whether this RAM block is associated with a stand-alone mapping
+    bool is_standalone;
     // Turns this object into a list node
     hax_list_node entry;
-    // TODO: refcount?
 } hax_ramblock;
 
 typedef struct hax_memslot {
     // == base_gpa >> PG_ORDER_4K
-    uint64 base_gfn;
+    uint64_t base_gfn;
     // == size >> PG_ORDER_4K
-    uint64 npages;
+    uint64_t npages;
     // Must not be NULL
     struct hax_ramblock *block;
     // In bytes. < block->size
-    uint64 offset_within_block;
+    uint64_t offset_within_block;
     // Read-only, etc.
-    uint8 flags;
+    uint32_t flags;
     // Turns this object into a list node
     hax_list_node entry;
 } hax_memslot;
 
 // Read-only mapping, == HAX_RAM_INFO_ROM in hax_interface.h
-#define HAX_MEMSLOT_READONLY 0x01
+#define HAX_MEMSLOT_READONLY (1 << 0)
+// Stand-alone mapping, == HAX_RAM_INFO_STANDALONE in hax_interface.h
+#define HAX_MEMSLOT_STANDALONE (1 << 6)
+
 // Unmapped, == HAX_RAM_INFO_INVALID in hax_interface.h
-// Used only by memslot_set_mapping(), not by any hax_memslot
-#define HAX_MEMSLOT_INVALID  0x80
+// Not to be used by hax_memslot::flags
+#define HAX_MEMSLOT_INVALID (1 << 7)
+
+typedef struct hax_gpa_prot {
+    // A bitmap where each bit represents the protection status of a guest page
+    // frame: 1 means protected (i.e. no access allowed), 0 not protected.
+    // TODO: Support fine-grained protection (R/W/X).
+    uint8_t *bitmap;
+    // the first gfn not covered by the bitmap
+    uint64_t end_gfn;
+} hax_gpa_prot;
 
 typedef struct hax_gpa_space {
+    // TODO: Add a lock to prevent concurrent accesses to |ramblock_list| and
+    // |memslot_list|
     hax_list_head ramblock_list;
     hax_list_head memslot_list;
     hax_list_head listener_list;
+    hax_gpa_prot prot;
 } hax_gpa_space;
 
 typedef struct hax_gpa_space_listener hax_gpa_space_listener;
 struct hax_gpa_space_listener {
     // For MMIO => RAM/ROM
-    void (*mapping_added)(hax_gpa_space_listener *listener, uint64 start_gfn,
-                          uint64 npages, uint64 uva, uint8 flags);
+    void (*mapping_added)(hax_gpa_space_listener *listener, uint64_t start_gfn,
+                          uint64_t npages, uint64_t uva, uint8_t flags);
     // For RAM/ROM => MMIO
-    void (*mapping_removed)(hax_gpa_space_listener *listener, uint64 start_gfn,
-                            uint64 npages, uint64 uva, uint8 flags);
+    void (*mapping_removed)(hax_gpa_space_listener *listener, uint64_t start_gfn,
+                            uint64_t npages, uint64_t uva, uint8_t flags);
     // For RAM/ROM => RAM/ROM
-    void (*mapping_changed)(hax_gpa_space_listener *listener, uint64 start_gfn,
-                            uint64 npages, uint64 old_uva, uint8 old_flags,
-                            uint64 new_uva, uint8 new_flags);
+    void (*mapping_changed)(hax_gpa_space_listener *listener, uint64_t start_gfn,
+                            uint64_t npages, uint64_t old_uva, uint8_t old_flags,
+                            uint64_t new_uva, uint8_t new_flags);
     hax_gpa_space *gpa_space;
     // Points to listener-specific data, e.g. a |hax_ept_tree|
     void *opaque;
@@ -124,7 +142,7 @@ void ramblock_dump_list(hax_list_head *list);
 //          head.
 // Returns a pointer to the |hax_ramblock| containing |uva|, or NULL if no such
 // |hax_ramblock| exists.
-hax_ramblock * ramblock_find(hax_list_head *list, uint64 uva,
+hax_ramblock * ramblock_find(hax_list_head *list, uint64_t uva,
                              hax_list_node *start);
 
 // Creates a |hax_ramblock| from the given UVA range and inserts it into the
@@ -141,7 +159,7 @@ hax_ramblock * ramblock_find(hax_list_head *list, uint64 uva,
 // -EINVAL: Invalid input, e.g. the given UVA range overlaps with that of an
 //          existing |hax_ramblock|.
 // -ENOMEM: Memory allocation error.
-int ramblock_add(hax_list_head *list, uint64 base_uva, uint64 size,
+int ramblock_add(hax_list_head *list, uint64_t base_uva, uint64_t size,
                  hax_list_node *start, hax_ramblock **block);
 
 // Returns the |hax_chunk| at the given offset in the given |hax_ramblock|’s UVA
@@ -160,8 +178,22 @@ int ramblock_add(hax_list_head *list, uint64 base_uva, uint64 size,
 // b) The |hax_chunk| has not been allocated and |alloc| is false.
 // c) The |hax_chunk| had not been allocated and |alloc| is true, but allocation
 //    was not successful.
-hax_chunk * ramblock_get_chunk(hax_ramblock *block, uint64 uva_offset,
+hax_chunk * ramblock_get_chunk(hax_ramblock *block, uint64_t uva_offset,
                                bool alloc);
+
+// Increments the reference count of an existing RAM block. The reference count
+// of a new RAM block created by ramblock_add() is initialized to 0. Whenever a
+// new reference to a RAM block is made, this function must be called.
+// |block|: A pointer to |hax_ramblock| being referenced.
+void ramblock_ref(hax_ramblock *block);
+
+// Decrements the reference count of the specified RAM block. Whenever a
+// reference to a RAM block is removed, this function must be called. If the
+// resulting reference count hits zero, removes the RAM block from the list it
+// belongs to, and frees the RAM block along with all the resources allocated
+// for it.
+// |block|: A pointer to |hax_ramblock| being dereferenced.
+void ramblock_deref(hax_ramblock *block);
 
 // Initializes |hax_memslot|-related data structures in the given
 // |hax_gpa_space|.
@@ -191,8 +223,8 @@ void memslot_dump_list(hax_gpa_space *gpa_space);
 // Returns 0 on success, or one of the following error codes:
 // -EINVAL: Invalid input.
 // -ENOMEM: Memory allocation error.
-int memslot_set_mapping(hax_gpa_space *gpa_space, uint64 start_gfn,
-                        uint64 npages, uint64 uva, uint8 flags);
+int memslot_set_mapping(hax_gpa_space *gpa_space, uint64_t start_gfn,
+                        uint64_t npages, uint64_t uva, uint32_t flags);
 
 // Finds in the given |hax_gpa_space| the |hax_memslot| containing the given
 // GFN.
@@ -200,7 +232,7 @@ int memslot_set_mapping(hax_gpa_space *gpa_space, uint64 start_gfn,
 // |gfn|: The GFN to search for.
 // Returns a pointer to the |hax_memslot| containing |gfn|, or NULL if no such
 // |hax_memslot| exists (indicating that |gfn| is reserved for MMIO).
-hax_memslot * memslot_find(hax_gpa_space *gpa_space, uint64 gfn);
+hax_memslot * memslot_find(hax_gpa_space *gpa_space, uint64_t gfn);
 
 // Initializes the given |hax_gpa_space|.
 // Returns 0 on success, or one of the following error codes:
@@ -233,8 +265,8 @@ void gpa_space_remove_listener(hax_gpa_space *gpa_space,
 // -EINVAL: Invalid input, e.g. |data| is NULL, or the GPA range specified by
 //          |start_gpa| and |len| touches an MMIO region.
 // -ENOMEM: Unable to map the requested guest page frames into KVA space.
-int gpa_space_read_data(hax_gpa_space *gpa_space, uint64 start_gpa, int len,
-                        uint8 *data);
+int gpa_space_read_data(hax_gpa_space *gpa_space, uint64_t start_gpa, int len,
+                        uint8_t *data);
 
 // Copies the given number of bytes from the given buffer to guest RAM.
 // |gpa_space|: The |hax_gpa_space| of the guest.
@@ -251,8 +283,8 @@ int gpa_space_read_data(hax_gpa_space *gpa_space, uint64 start_gpa, int len,
 // -ENOMEM: Unable to map the requested guest page frames into KVA space.
 // -EACCES: The GPA range specified by |start_gpa| and |len| touches a ROM
 //          region.
-int gpa_space_write_data(hax_gpa_space *gpa_space, uint64 start_gpa, int len,
-                         uint8 *data);
+int gpa_space_write_data(hax_gpa_space *gpa_space, uint64_t start_gpa, int len,
+                         uint8_t *data);
 
 // Maps the given guest page frame into KVA space, stores the KVA mapping in the
 // given buffer, and returns the KVA. The caller must destroy the KVA mapping
@@ -265,7 +297,7 @@ int gpa_space_write_data(hax_gpa_space *gpa_space, uint64 start_gpa, int len,
 //             page frame is writable (i.e. maps to RAM). Can be NULL if the
 //             caller only wants to read from the page.
 // Returns NULL on error.
-void * gpa_space_map_page(hax_gpa_space *gpa_space, uint64 gfn,
+void * gpa_space_map_page(hax_gpa_space *gpa_space, uint64_t gfn,
                           hax_kmap_user *kmap, bool *writable);
 
 // Destroys the KVA mapping previously created by gpa_space_map_page().
@@ -279,7 +311,21 @@ void gpa_space_unmap_page(hax_gpa_space *gpa_space, hax_kmap_user *kmap);
 //          interested in this information.
 // Returns INVALID_PFN on error, including the case where |gfn| is reserved for
 // MMIO.
-uint64 gpa_space_get_pfn(hax_gpa_space *gpa_space, uint64 gfn, uint8 *flags);
+uint64_t gpa_space_get_pfn(hax_gpa_space *gpa_space, uint64_t gfn, uint8_t *flags);
+
+int gpa_space_protect_range(struct hax_gpa_space *gpa_space,
+                            uint64_t start_gpa, uint64_t len, uint32_t flags);
+
+// Adjust gpa protection bitmap size. Once a bigger gfn is met, allocate
+// a new bitmap and copy the old bitmap contents.
+// |gpa_space|: The GPA space of the guest.
+// |end_gfn|: The first GFN not covered by the new bitmap.
+int gpa_space_adjust_prot_bitmap(struct hax_gpa_space *gpa_space,
+                                 uint64_t end_gfn);
+
+bool gpa_space_is_page_protected(struct hax_gpa_space *gpa_space, uint64_t gfn);
+bool gpa_space_is_chunk_protected(struct hax_gpa_space *gpa_space, uint64_t gfn,
+                                  uint64_t *fault_gfn);
 
 // Allocates a |hax_chunk| for the given UVA range, and pins the corresponding
 // host page frames in RAM.
@@ -290,7 +336,7 @@ uint64 gpa_space_get_pfn(hax_gpa_space *gpa_space, uint64 gfn, uint8 *flags);
 // -EINVAL: Invalid input, e.g. |chunk| is NULL, or the UVA range given by
 //          |base_uva| and |size| is not valid.
 // -ENOMEM: Memory allocation error.
-int chunk_alloc(uint64 base_uva, uint64 size, hax_chunk **chunk);
+int chunk_alloc(uint64_t base_uva, uint64_t size, hax_chunk **chunk);
 
 // Frees up resources taken up by the given |hax_chunk|, which includes
 // unpinning all host page frames backing it.

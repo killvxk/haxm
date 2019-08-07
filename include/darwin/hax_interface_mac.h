@@ -49,6 +49,9 @@
 #define HAX_VM_IOCTL_ALLOC_RAM _IOWR(0, 0x81, struct hax_alloc_ram_info)
 #define HAX_VM_IOCTL_SET_RAM _IOWR(0, 0x82, struct hax_set_ram_info)
 #define HAX_VM_IOCTL_VCPU_DESTROY _IOR(0, 0x83, uint32_t)
+#define HAX_VM_IOCTL_ADD_RAMBLOCK _IOW(0, 0x85, struct hax_ramblock_info)
+#define HAX_VM_IOCTL_SET_RAM2 _IOWR(0, 0x86, struct hax_set_ram_info2)
+#define HAX_VM_IOCTL_PROTECT_RAM _IOWR(0, 0x87, struct hax_protect_ram_info)
 
 #define HAX_VCPU_IOCTL_RUN _IO(0, 0xc0)
 #define HAX_VCPU_IOCTL_SET_MSRS _IOWR(0, 0xc1, struct hax_msr_data)
@@ -64,6 +67,8 @@
 
 /* API 2.0 */
 #define HAX_VM_IOCTL_NOTIFY_QEMU_VERSION _IOW(0, 0x84, struct hax_qemu_version)
+
+#define HAX_IOCTL_VCPU_DEBUG _IOW(0, 0xc9, struct hax_debug_t)
 
 #define HAX_KERNEL64_CS 0x80
 #define HAX_KERNEL32_CS 0x08

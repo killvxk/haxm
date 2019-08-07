@@ -34,17 +34,11 @@
 //#include <ntddk.h>
 #include <ntifs.h>
 
-#ifdef _WIN64
-#define __x86_64__ 1
-#else
-#define __i386__ 1
-#endif
-
 #ifndef HAX_UNIFIED_BINARY
 
 /*
  * According to DDK, the IoAllocateMdl can support at mos
- * 64M - page_size * (sizeof(MDL)) / sizeof(ULONG_PTR), so
+ * 64M - PAGE_SIZE * (sizeof(MDL)) / sizeof(ULONG_PTR), so
  * take 32M here
  */
 #if (NTDDI_VERSION <= NTDDI_WS03)
@@ -55,10 +49,6 @@
 #else /* HAX_UNIFIED_BINARY */
 #define HAX_RAM_ENTRY_SIZE 0x2000000
 #endif
-
-#define page_size 4096
-#define page_shift 12
-#define page_mask 0xfff
 
 static inline hax_spinlock *hax_spinlock_alloc_init(void)
 {
@@ -170,7 +160,7 @@ static bool hax_test_bit(int bit, uint64_t *memory)
 }
 
 /* Why it's a bool? Strange */
-static bool hax_cmpxchg32(uint32 old_val, uint32 new_val, volatile uint32 *addr)
+static bool hax_cmpxchg32(uint32_t old_val, uint32_t new_val, volatile uint32_t *addr)
 {
     long ret;
 
@@ -182,7 +172,7 @@ static bool hax_cmpxchg32(uint32 old_val, uint32 new_val, volatile uint32 *addr)
         return FALSE;
 }
 
-static bool hax_cmpxchg64(uint64 old_val, uint64 new_val, volatile uint64 *addr)
+static bool hax_cmpxchg64(uint64_t old_val, uint64_t new_val, volatile uint64_t *addr)
 {
     LONGLONG ret;
 
@@ -204,18 +194,6 @@ static inline bool cpu_is_online(int cpu)
 int hax_notify_host_event(enum hax_notify_event event, uint32_t *param,
                           uint32_t size);
 
-extern int default_hax_log_level;
-
-void hax_error(char *fmt, ...);
-void hax_warning(char *fmt, ...);
-void hax_info(char *fmt, ...);
-void hax_debug(char *fmt, ...);
-void hax_log(char *fmt, ...);
-
-#define hax_log hax_info
-
-#define hax_panic DbgPrint
-
-#define assert(condition) ASSERT(condition)
+#define hax_assert(condition) ASSERT(condition)
 
 #endif  // HAX_WINDOWS_HAX_WINDOWS_H_
